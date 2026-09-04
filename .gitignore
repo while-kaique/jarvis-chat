@@ -1,0 +1,29 @@
+# --- dados de execucao: NUNCA subir ---
+# Tudo aqui tem conteudo real de conversa, nome de pessoa ou estado da instalacao.
+logs/
+*.log
+run.lock
+alertas-pendentes.json
+avisos-urgentes.jsonl
+disparados.jsonl
+pendente-envio.jsonl
+entregues.log
+
+# --- segredos ---
+.env
+.env.*
+*.credentials.json
+credentials/
+*.key
+*.pem
+
+# --- diario da instalacao (local, nao distribuivel) ---
+ESTADO.md
+
+# --- lixo de sistema ---
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# fila de falhas da maquina local (drenada pelo cerebro na run seguinte)
+falhas.jsonl
