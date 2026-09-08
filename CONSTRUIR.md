@@ -926,12 +926,19 @@ end $$;
 
 ---
 
-## 5b. As migracoes seguintes — nao estao transcritas aqui
+## 5b. As migracoes seguintes
+
+> **Para instalar, use [`sql/00-fundacao/`](sql/00-fundacao/).** Aquela pasta e o estado
+> atual do banco em 8 arquivos ordenados — schema, funcoes, entrega, porta e seed —
+> e inclui tudo que as 17 migracoes abaixo fizeram. As secoes 3 a 5 deste arquivo
+> transcrevem as tres primeiras migracoes com o raciocinio de cada decisao: leia para
+> **entender**, aplique a pasta para **montar**. Nao faca os dois.
 
 As migracoes 1 a 3 estao acima na integra porque sao a fundacao: schema, invariantes e o
-ciclo da run. O que veio depois **nao esta copiado neste arquivo de proposito** — sao ~20 KB
-de SQL que iriam divergir da realidade no primeiro ajuste, e o historico de migracoes do
-Supabase e a fonte de verdade.
+ciclo da run. As seguintes nunca foram transcritas aqui — eram ~20 KB de SQL que iriam
+divergir da realidade no primeiro ajuste. O efeito colateral disso era que o Passo 6 do
+`COMO_INSTALAR.md` mandava criar `jarvis.entregar()` sem dar o codigo, e ninguem conseguia
+instalar; a pasta `sql/00-fundacao/` existe para tapar exatamente esse furo.
 
 Na ordem em que foram aplicadas:
 
@@ -955,11 +962,19 @@ Na ordem em que foram aplicadas:
 | `jarvis_calendario_pelo_banco` | `jarvis.calendario` e a porta atualizada |
 | `jarvis_entrega_em_lote` | vários vencidos viram uma mensagem só |
 
-Para reconstruir num projeto novo: liste as migracoes pelo MCP do Supabase e aplique nesta
-ordem. Para inspecionar uma funcao especifica no ar,
+Para reconstruir num projeto novo **nao siga esta lista** — o historico de migracoes vive
+no projeto Supabase de quem construiu, e voce nao tem acesso a ele. Aplique
+`sql/00-fundacao/` na ordem numerica. A lista acima serve para saber *quando* cada peca
+entrou e por que. Para inspecionar uma funcao especifica no ar,
 `select pg_get_functiondef('jarvis.entregar(text)'::regprocedure)`.
 
 ## 6. Seed do estado
+
+> Prefira **`sql/00-fundacao/08-seed.sql`**, que e este seed atualizado e comentado. O
+> bloco abaixo cria 7 chaves; sao **9** as necessarias. Faltam `visto` e `ultima_entrega`,
+> e a falta e silenciosa: `fechar_run` e `entregar` fazem `update` nelas, e um `update` em
+> linha inexistente nao da erro — so nao grava. Sem `visto`, `tem_trabalho` acha que nada
+> mudou desde a run anterior e o cerebro nunca trabalha.
 
 `execute_sql`. **Troque os valores pelos que você descobriu no passo 2.**
 

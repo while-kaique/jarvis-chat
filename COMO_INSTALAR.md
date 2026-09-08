@@ -122,17 +122,27 @@ Detalhe completo: **`CONSTRUIR.md`, seção 2.** Anote antes de rodar as migraç
 
 ## Passo 4 — Monte o banco
 
-Detalhe completo: **`CONSTRUIR.md`, seções 3 a 6.** As três migrações estão lá na íntegra,
-prontas para colar no SQL Editor do Supabase, nesta ordem:
+Todo o SQL está em **[`sql/00-fundacao/`](sql/00-fundacao/)**. Aplique os arquivos em
+ordem numérica, um por vez, no SQL Editor do Supabase:
 
-1. `jarvis_chat_memoria_remota` — schema e as 5 tabelas
-2. `jarvis_chat_funcoes` — as invariantes de escrita
-3. `jarvis_chat_ciclo_da_run` — lock, turno, briefing, poda, `fechar_run`
+```
+01-schema-tabelas.sql    schema, 11 tabelas, indices
+02-funcoes-base.sql      slug, fingerprint, lock, turno, podar
+03-escrita.sql           upsert_compromisso e as invariantes
+04-leitura.sql           briefing, calendario, tem_trabalho
+05-entrega.sql           <- crie o segredo do webhook ANTES deste
+06-porta-e-pedidos.sql   jarvis_rpc (so para o cerebro na nuvem)
+07-consumo.sql           opcional: quanto cada run gastou
+08-seed.sql              <- O UNICO que voce edita
+```
 
-As migrações seguintes (entrega, rótulos, calendário, pedidos) estão listadas na
-**seção 5b** com o que cada uma traz, e os contratos completos nas seções 10 e 18.
+O `README.md` daquela pasta traz a ordem, o que cada arquivo depende e as consultas de
+conferência. **Não aplique também** as seções 3 a 5 do `CONSTRUIR.md` nem os `sql/*.sql`
+datados: aqueles são o histórico comentado, e já estão inteiros na fundação.
 
-Depois, o **seed** da seção 6 com os valores do passo 3.
+Para entender *por que* cada invariante existe, leia as seções 3 a 5 do
+[`CONSTRUIR.md`](CONSTRUIR.md) — elas transcrevem as três primeiras migrações com o
+raciocínio de cada decisão.
 
 > **Nunca escreva `insert`/`update` na mão** nas tabelas do `jarvis`. Toda escrita passa
 > por função — é o que garante deduplicação, citação de origem e cancelamento de zumbi.
@@ -151,13 +161,18 @@ Se algum retorno divergir do esperado, **pare e corrija** antes de escrever os s
 
 ## Passo 6 — A entrega, dentro do banco
 
-Detalhe completo: **`CONSTRUIR.md`, seção 10.**
-
-Ative a extensão `http`, crie `jarvis.postar_webhook()`, `jarvis.entregar()` e
-`jarvis.vigiar()`, e agende o `cron.job` de 5 em 5 minutos.
+Já veio no passo 4: é o `sql/00-fundacao/05-entrega.sql`, que ativa a extensão `http`, cria
+`jarvis.postar_webhook()`, `jarvis.entregar()` e `jarvis.vigiar()`, e agenda o `cron.job` de
+5 em 5 minutos. O porquê de cada decisão está na **seção 10 do `CONSTRUIR.md`**.
 
 Custo: `jarvis.entregar()` conta os vencidos **antes** de tocar em rede. Nas ~280 execuções
 diárias vazias ela sai sem gastar nada.
+
+Confirme que o cron entrou:
+
+```sql
+select jobname, schedule, active from cron.job where jobname = 'jarvis-entrega';
+```
 
 ---
 
@@ -237,7 +252,8 @@ passo 2.
 | `prompt-nuvem.md` | as instruções do cérebro na nuvem (fonte de `jarvis.prompt`) |
 | `escuta.ps1` | o cérebro local, chamado pelo Agendador |
 | `oculto.vbs` | lançador silencioso (esconde a janela sem exigir admin) |
-| `sql/` | migrações incrementais aplicadas depois das três primeiras |
+| `sql/00-fundacao/` | **todo o SQL do zero**, em 8 arquivos ordenados |
+| `sql/*.sql` | patches incrementais históricos — já inclusos na fundação |
 | `OTIMIZAR-CONSUMO.md` | como o agente anota e reduz o próprio gasto |
 | `desativado/` | o entregador local antigo, guardado como reserva documentada |
 
