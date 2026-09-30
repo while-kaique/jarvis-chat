@@ -12,6 +12,12 @@
 --
 -- `calendario` e `tem_trabalho` chamam a rede (Google Calendar)
 -- e dependem de jarvis.token_google(), do 05-entrega.sql.
+-- `briefing` tambem chama a rede agora (reacoes_dele, no 05, para
+-- ver se ele reagiu com emoji); se falhar, devolve `reacoes_erro`
+-- e segue com a lista sem esse filtro.
+--
+-- A leitura do proprio Chat (chat_ler, chat_conversa, chat_get)
+-- mora no 10-leitura-do-chat.sql.
 -- ============================================================
 
 -- ---------- assuntos_relevantes: busca em portugues, com fallback ----------
@@ -83,11 +89,18 @@ as $function$
 $function$;
 
 -- ---------- briefing: TODO o contexto que o cerebro recebe ----------
+-- Duas mudancas desde a primeira versao:
+--   * toda comparacao do silencio_dele e por chave_espaco (a CONVERSA),
+--     nao por space_id -- o mesmo grupo chegava com dois ids;
+--   * reacao dele com emoji e devolutiva (25/09/2026): emoji claro tira a
+--     pergunta da lista (vai para `reagidas_ok`), emoji ambiguo fica, com
+--     `reacao_dele`. Isso chama a API do Chat (reacoes_dele, no 05), por
+--     isso a funcao deixou de ser STABLE.
 create or replace function jarvis.briefing(p_texto_novo text default '', p_top integer default null)
- returns jsonb language plpgsql stable
+ returns jsonb language plpgsql
 as $function$
 declare
-  v_cfg jsonb; v_top int; v_out jsonb;
+  v_cfg jsonb; v_top int; v_out jsonb; v_sil jsonb;
 begin
   select valor into v_cfg from jarvis.estado where chave = 'config';
   v_top := coalesce(p_top, (v_cfg->>'top_assuntos')::int, 8);
@@ -133,24 +146,28 @@ begin
                'pessoas', r.pessoas, 'mencoes', r.mencoes,
                'ultima_vez_brt', to_char(r.ultima_vez at time zone 'America/Sao_Paulo', 'DD/MM')))
         from jarvis.assuntos_relevantes(p_texto_novo, v_top) r), '[]'::jsonb),
-    -- perguntas feitas a VOCE que ainda estao sem resposta. Cada `not exists`
-    -- abaixo tapa um falso positivo que ja apareceu na pratica.
+    -- Toda comparacao daqui pra baixo e por jarvis.chave_espaco (a CONVERSA), nunca por
+    -- space_id: o mesmo grupo chega com dois space_id diferentes (varredura x
+    -- aprofundamento), e casar por id fazia a resposta dele num balde nao fechar a
+    -- pergunta gravada no outro. Foi o falso "ninguem respondeu" do Carlos.
     'silencio_dele', coalesce((
       select jsonb_agg(jsonb_build_object(
                'space', m.space_nome, 'de', coalesce(m.autor_nome, m.autor_id),
                'quando_brt', to_char(m.create_time at time zone 'America/Sao_Paulo', 'DD/MM HH24:MI'),
                'msg_time_utc', to_char(m.create_time at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
                'horas_parada', round((extract(epoch from (now() - m.create_time)) / 3600.0)::numeric, 1),
-               'texto', left(m.texto, 200),
+               'texto', left(m.texto, 200), 'space_id', m.space_id, 'autor_id', m.autor_id,
                'dele_antes_min', (
                   select round((extract(epoch from (m.create_time - max(a.create_time))) / 60.0)::numeric, 1)
                     from jarvis.mensagens a
-                   where a.space_id = m.space_id and a.is_dono
+                   where jarvis.chave_espaco(a.space_id, a.space_nome) = jarvis.chave_espaco(m.space_id, m.space_nome)
+                     and a.is_dono
                      and a.create_time < m.create_time
                      and a.create_time > m.create_time - interval '60 minutes'),
                'autor_insistiu', exists (
                   select 1 from jarvis.mensagens i
-                   where i.space_id = m.space_id and i.autor_id = m.autor_id
+                   where jarvis.chave_espaco(i.space_id, i.space_nome) = jarvis.chave_espaco(m.space_id, m.space_nome)
+                     and i.autor_id = m.autor_id
                      and i.create_time > m.create_time and i.texto like '%?%'),
                'depois', coalesce((
                   select jsonb_agg(jsonb_build_object(
@@ -158,7 +175,8 @@ begin
                            'quando_brt', to_char(d.create_time at time zone 'America/Sao_Paulo', 'DD/MM HH24:MI'),
                            'texto', left(d.texto, 150)))
                     from (select * from jarvis.mensagens dd
-                           where dd.space_id = m.space_id and dd.create_time > m.create_time
+                           where jarvis.chave_espaco(dd.space_id, dd.space_nome) = jarvis.chave_espaco(m.space_id, m.space_nome)
+                             and dd.create_time > m.create_time
                            order by dd.create_time limit 6) d), '[]'::jsonb)
              ) order by m.create_time desc)
         from jarvis.mensagens m
@@ -170,33 +188,34 @@ begin
                  from jarvis.estado where chave = 'ruido')
          and coalesce(m.autor_nome, '') !~* '(bot|automa[çc][ãa]o|alerta|relat[óo]rio)'
          and m.create_time < now() - make_interval(hours => coalesce((v_cfg->>'silencio_pergunta_horas')::int, 1))
-         -- voce ja respondeu depois dela
          and not exists (
                select 1 from jarvis.mensagens r
-                where r.space_id = m.space_id and r.is_dono and r.create_time > m.create_time)
-         -- outra pessoa respondeu em 30 min: nao era pergunta sua
+                where jarvis.chave_espaco(r.space_id, r.space_nome) = jarvis.chave_espaco(m.space_id, m.space_nome)
+                  and r.is_dono and r.create_time > m.create_time)
          and not exists (
                select 1 from jarvis.mensagens o
-                where o.space_id = m.space_id and not o.is_dono
+                where jarvis.chave_espaco(o.space_id, o.space_nome) = jarvis.chave_espaco(m.space_id, m.space_nome)
+                  and not o.is_dono
                   and o.autor_id is distinct from m.autor_id
                   and o.create_time >  m.create_time
                   and o.create_time <= m.create_time + interval '30 minutes')
-         -- conversa estava ativa agora e o autor nao insistiu: da tempo
          and not (
                exists (
                  select 1 from jarvis.mensagens a
-                  where a.space_id = m.space_id and a.is_dono
+                  where jarvis.chave_espaco(a.space_id, a.space_nome) = jarvis.chave_espaco(m.space_id, m.space_nome)
+                    and a.is_dono
                     and a.create_time < m.create_time
                     and a.create_time >= m.create_time
                         - make_interval(mins => coalesce((v_cfg->>'conversa_ativa_min')::int, 5)))
            and not exists (
                  select 1 from jarvis.mensagens i
-                  where i.space_id = m.space_id and i.autor_id = m.autor_id
+                  where jarvis.chave_espaco(i.space_id, i.space_nome) = jarvis.chave_espaco(m.space_id, m.space_nome)
+                    and i.autor_id = m.autor_id
                     and i.create_time > m.create_time and i.texto like '%?%'))
-         -- o proprio autor encerrou com um "blz"
          and not exists (
                select 1 from jarvis.mensagens f
-                where f.space_id = m.space_id and f.autor_id = m.autor_id
+                where jarvis.chave_espaco(f.space_id, f.space_nome) = jarvis.chave_espaco(m.space_id, m.space_nome)
+                  and f.autor_id = m.autor_id
                   and f.create_time >  m.create_time
                   and f.create_time <= m.create_time
                       + make_interval(mins => coalesce((v_cfg->>'encerrou_autor_min')::int, 30))
@@ -206,8 +225,72 @@ begin
        limit 15), '[]'::jsonb)
   ) into v_out;
 
+  -- 25/09/2026: reação dele com emoji é devolutiva. Emoji claro (👍 ✅ 👌 🫡 ...) tira a
+  -- pergunta da lista e vai para `reagidas_ok`; emoji ambíguo fica, com `reacao_dele`.
+  if jsonb_array_length(coalesce(v_out->'silencio_dele', '[]'::jsonb)) > 0 then
+    begin
+      v_sil := jarvis.reacoes_dele((select jsonb_agg(s || jsonb_build_object('msg_time', s->>'msg_time_utc'))
+                                      from jsonb_array_elements(v_out->'silencio_dele') s));
+      v_out := jsonb_set(v_out, '{silencio_dele}', coalesce((
+                 select jsonb_agg(s - 'msg_time') from jsonb_array_elements(v_sil) s
+                  where not coalesce((s->'reacao_dele'->>'claro')::boolean, false)), '[]'::jsonb));
+      v_out := v_out || jsonb_build_object('reagidas_ok', coalesce((
+                 select jsonb_agg(jsonb_build_object('space', s->>'space', 'de', s->>'de',
+                          'quando_brt', s->>'quando_brt', 'texto', left(s->>'texto', 100),
+                          'emojis', s->'reacao_dele'->'emojis'))
+                   from jsonb_array_elements(v_sil) s
+                  where coalesce((s->'reacao_dele'->>'claro')::boolean, false)), '[]'::jsonb));
+    exception when others then
+      v_out := v_out || jsonb_build_object('reacoes_erro', sqlerrm);
+    end;
+  end if;
+
   return v_out;
 end $function$;
+
+-- ---------- dm_espaco / dms_a_resolver: o mapa das DMs ----------
+-- dm_espaco: nome da pessoa -> id da DM com ela (o nome mais longo que casa).
+-- dms_a_resolver: dos ids de DM que o cerebro viu, quais ainda nao tem
+-- pessoa no mapa (e ainda nao foram tentados 3 vezes) -- no maximo 6 por run.
+create or replace function jarvis.dm_espaco(p_pessoa text)
+ returns text language sql stable
+as $function$
+  select d.space_id from jarvis.dm_mapa d
+   where d.pessoa_nome is not null
+     and ( jarvis.slug(d.pessoa_nome) = jarvis.slug(coalesce(p_pessoa,''))
+        or jarvis.slug(coalesce(p_pessoa,'')) like '%' || jarvis.slug(d.pessoa_nome) || '%' )
+   order by length(d.pessoa_nome) desc
+   limit 1
+$function$;
+
+create or replace function jarvis.dms_a_resolver(p_ids jsonb, p_limite integer default 6)
+ returns jsonb language sql stable
+as $function$
+  select coalesce(jsonb_agg(x order by x), '[]'::jsonb) from (
+    select x from jsonb_array_elements_text(coalesce(p_ids,'[]'::jsonb)) x
+     where x like 'spaces/%'
+       and not exists (select 1 from jarvis.dm_mapa d
+                        where d.space_id = x
+                          and (d.pessoa_nome is not null or d.tentativas >= 3))
+     limit greatest(coalesce(p_limite,6), 1)
+  ) t
+$function$;
+
+-- ---------- avisos_da_conversa: ele respondeu DENTRO de um aviso ----------
+-- Quando o aviso sai pelo app do Chat, a conversa (thread) fica gravada em
+-- compromissos.chat_thread. Uma resposta dele naquela conversa ("ja fiz",
+-- "adia pra sexta") e sobre estes avisos, sem precisar dizer "jarvis".
+create or replace function jarvis.avisos_da_conversa(p_thread text)
+ returns table(id bigint, titulo text, subtipo text, status text,
+               alerta_em_utc timestamptz, token text, serie text)
+ language sql stable
+ set search_path to ''
+as $function$
+  select c.id, c.titulo, c.subtipo, c.status, c.alerta_em_utc, c.token, c.serie::text
+    from jarvis.compromissos c
+   where c.chat_thread = p_thread
+   order by c.id;
+$function$;
 
 -- ---------- calendario: le o Google Calendar pelo proprio banco ----------
 create or replace function jarvis.calendario(p_dias integer default 14)

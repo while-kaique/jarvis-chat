@@ -27,3 +27,16 @@ desktop.ini
 
 # fila de falhas da maquina local (drenada pelo cerebro na run seguinte)
 falhas.jsonl
+
+# token do sincronizar-google.ps1 (cifrado com DPAPI, mas e o que abre a porta do cofre)
+sync-google.token
+
+# painel de gasto: o config.js local tem a URL e a chave do banco (use config.exemplo.js)
+jarvis-gasto/config.js
+
+# copias de seguranca, transporte e pecas locais da instalacao
+*.bak
+*.bak-*
+sql/b64.txt
+diario-local/
+.claude/

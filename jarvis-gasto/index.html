@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gasto do Jarvis</title>
+<meta name="description" content="Quanto o Jarvis consumiu hoje, na semana e no mês.">
+<meta name="robots" content="noindex, nofollow">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&family=Work+Sans:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="wrap topbar-in">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Gasto do Jarvis</span>
+    </div>
+    <div class="topbar-right">
+      <span class="sync" id="syncState" title="Última leitura do banco">—</span>
+      <button type="button" class="icon-btn" id="themeBtn" aria-label="Alternar tema claro e escuro" title="Alternar tema">◑</button>
+      <button type="button" class="ghost-btn" id="reloadBtn">Atualizar</button>
+    </div>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap hero-in">
+    <div class="hero-top">
+      <div class="hero-headline">
+        <span class="hero-eyebrow" id="heroEyebrow">Gasto de hoje</span>
+        <strong class="hero-value" id="heroValor">—</strong>
+        <span class="hero-when" id="heroQuando"></span>
+      </div>
+      <div class="hero-switch" id="janela" role="group" aria-label="Período do gráfico">
+        <button type="button" data-janela="hoje" aria-pressed="true">Hoje</button>
+        <button type="button" data-janela="7" aria-pressed="false">7 dias</button>
+        <button type="button" data-janela="30" aria-pressed="false">30 dias</button>
+      </div>
+    </div>
+
+    <div class="hero-chart">
+      <div id="grafico"></div>
+      <div class="hero-lock" id="graficoVazio" hidden>
+        <strong>Sem leitura ainda</strong>
+        <span id="graficoVazioTexto">Confira a conexão com o banco no fim da página.</span>
+      </div>
+    </div>
+    <ul class="legend legend-chart" id="legenda"></ul>
+
+    <div class="hero-facts">
+      <div><span>Passadas</span><strong id="fRuns">—</strong></div>
+      <div><span>Custo por passada</span><strong id="fPorRun">—</strong></div>
+      <div><span>Tokens</span><strong id="fTokens">—</strong></div>
+      <div><span>Passos por passada</span><strong id="fTurnos">—</strong></div>
+    </div>
+  </div>
+</section>
+
+<section class="faixa">
+  <div class="wrap faixa-in">
+    <div class="cards">
+      <article class="card">
+        <span class="card-rot">Ontem</span>
+        <strong class="card-val" id="cOntem">—</strong>
+        <span class="card-sub" id="cOntemSub"></span>
+      </article>
+      <article class="card">
+        <span class="card-rot">Últimos 7 dias</span>
+        <strong class="card-val" id="cSemana">—</strong>
+        <span class="card-sub" id="cSemanaSub"></span>
+      </article>
+      <article class="card">
+        <span class="card-rot">Este mês</span>
+        <strong class="card-val" id="cMes">—</strong>
+        <span class="card-sub" id="cMesSub"></span>
+      </article>
+      <article class="card">
+        <span class="card-rot">Desde o começo</span>
+        <strong class="card-val" id="cTotal">—</strong>
+        <span class="card-sub" id="cTotalSub"></span>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="gastos">
+  <div class="wrap">
+    <div class="gastos-head">
+      <div>
+        <div class="gastos-titulo"><h2>Dormindo contra acordado</h2></div>
+        <span class="gastos-sub" id="turnoSub">De 0h às 7h ele trabalha sozinho — e cobra igual.</span>
+      </div>
+    </div>
+    <div class="turno" id="turno"></div>
+  </div>
+</section>
+
+<section class="gastos">
+  <div class="wrap">
+    <div class="gastos-head">
+      <div>
+        <div class="gastos-titulo"><h2>Quem gasta o quê</h2></div>
+        <span class="gastos-sub" id="rotinaSub"></span>
+      </div>
+    </div>
+    <div class="tabela" id="rotinas" role="table" aria-label="Consumo por rotina"></div>
+  </div>
+</section>
+
+<footer class="rodape">
+  <div class="wrap">
+    <p id="conexao">—</p>
+    <p class="nota">
+      O valor em dólar é <strong>quanto isso custaria na API</strong>. As rotinas rodam
+      na assinatura do dono, então serve de ordem de grandeza — não é fatura.
+    </p>
+  </div>
+</footer>
+
+<script src="config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -22,19 +22,30 @@
 
 -- ---------- agendar_pedido: "jarvis, me lembra de X" ----------
 -- Teto de 60 ocorrencias e piso de 5 min no intervalo. Sem
--- repetir_ate explicito o pedido morre em 8h: cron sem fim vira ruido.
+-- repetir_ate explicito, pedido de intervalo curto morre em 8h
+-- (cron sem fim vira ruido) e pedido diario ou mais espacado
+-- dura 30 dias (18/09/2026: antes o diario morria na 1a vez, e o
+-- prompt inventava "+7 dias" para compensar).
+-- A confirmacao sai na hora como aviso `lembrete_criado`, dizendo
+-- como parar ("cancele o lembrete de X" -> achar_serie + encerrar_serie).
+--
+-- A versao de 10 argumentos (a desta pasta antes de 30/09) sai:
+-- duas versoes = "function is not unique".
+drop function if exists jarvis.agendar_pedido(text, text, timestamptz, integer, timestamptz,
+  text, text, timestamptz, text, boolean);
 create or replace function jarvis.agendar_pedido(
   p_titulo text, p_origem_texto text,
   p_alerta_em timestamptz default null, p_repetir_min integer default null,
   p_repetir_ate timestamptz default null, p_mensagem_alerta text default null,
   p_prioridade text default 'normal', p_origem_msg_time timestamptz default null,
-  p_run_id text default null, p_confirmar boolean default true)
+  p_run_id text default null, p_confirmar boolean default true,
+  p_urgencia_motivo text default null)
  returns jsonb language plpgsql
 as $function$
 declare
   v_cfg jsonb; v_space text; v_space_nome text;
   v_handle text; v_serie text; v_alerta timestamptz; v_ate timestamptz;
-  v_prio text; v_n int; v_id bigint; v_txt text; v_quando_txt text;
+  v_prio text; v_n int; v_id bigint; v_txt text; v_quando_txt text; v_curto text;
   c_teto_ocorrencias int := 60;
 begin
   if coalesce(btrim(p_titulo), '') = '' then
@@ -43,6 +54,9 @@ begin
   if coalesce(btrim(p_origem_texto), '') = '' then
     raise exception 'origem_texto vazio: nem pedido dele entra sem a citacao literal';
   end if;
+
+  perform jarvis.checar_alerta_vago(p_mensagem_alerta, 'agendar_pedido');
+  perform jarvis.checar_alerta_vago(p_titulo, 'agendar_pedido (titulo)');
 
   select valor into v_cfg from jarvis.estado where chave = 'config';
   v_space      := coalesce(v_cfg->>'space_alerta', 'spaces/SEU_SPACE_ID');
@@ -63,11 +77,21 @@ begin
     if p_repetir_min < 5 then
       raise exception 'intervalo de % min e menor que o piso de 5 min (a entrega roda de 5 em 5)', p_repetir_min;
     end if;
-    -- sem teto explicito, um pedido repetido morre em 8h: cron sem fim vira ruido
-    v_ate := coalesce(p_repetir_ate, greatest(v_alerta, now()) + interval '8 hours');
+
+    -- Sem data de fim: diario (ou mais espacado) usa 30 dias de padrao -- pedido dele,
+    -- 18/09/2026 ("eu cancelo se precisar quando passar o evento"). Nagging de intervalo
+    -- curto (5 a 60 min) continua cortando em 8h, que e o que impede virar enxurrada.
+    -- Data de fim EXPLICITA dele sempre vale, do jeito que ele pediu.
+    if p_repetir_ate is null and p_repetir_min >= 1440 then
+      v_ate := greatest(v_alerta, now()) + interval '30 days';
+    else
+      v_ate := coalesce(p_repetir_ate, greatest(v_alerta, now()) + interval '8 hours');
+    end if;
+
     if v_ate <= v_alerta then
       raise exception 'repetir_ate (%) nao e depois do primeiro alerta (%)', v_ate, v_alerta;
     end if;
+
     v_n := floor(extract(epoch from (v_ate - v_alerta)) / (p_repetir_min * 60))::int + 1;
     if v_n > c_teto_ocorrencias then
       raise exception 'esse pedido geraria % avisos (teto %): aumente o intervalo ou encurte a janela',
@@ -76,15 +100,15 @@ begin
   end if;
 
   insert into jarvis.compromissos
-    (tipo, titulo, alerta_em_utc, prioridade, mensagem_alerta, origem_texto,
+    (tipo, subtipo, titulo, quando_utc, alerta_em_utc, prioridade, mensagem_alerta, origem_texto,
      origem_msg_time, origem_autor, space_origem, space_origem_nome,
-     fingerprint, serie, repetir_min, repetir_ate)
+     fingerprint, serie, repetir_min, repetir_ate, urgencia_motivo)
   values
-    ('lembrete', btrim(p_titulo), v_alerta, v_prio,
-     coalesce(p_mensagem_alerta, '*' || btrim(p_titulo) || '*'), btrim(p_origem_texto),
+    ('lembrete', 'lembrete', btrim(p_titulo), v_alerta, v_alerta, v_prio,
+     coalesce(p_mensagem_alerta, btrim(p_titulo)), btrim(p_origem_texto),
      p_origem_msg_time, v_cfg->>'self_user_id', v_space, v_space_nome,
      v_serie || ':' || to_char(v_alerta at time zone 'UTC', 'YYYYMMDD"T"HH24MI'),
-     v_serie, p_repetir_min, v_ate)
+     v_serie, p_repetir_min, v_ate, nullif(btrim(coalesce(p_urgencia_motivo,'')), ''))
   returning id into v_id;
 
   insert into jarvis.eventos (compromisso_id, acao, motivo, depois, run_id)
@@ -93,40 +117,52 @@ begin
                              'repetir_min', p_repetir_min, 'repetir_ate', v_ate,
                              'serie', v_serie, 'prioridade', v_prio), p_run_id);
 
-  -- confirmacao imediata: ele precisa saber que o pedido pegou, e como desligar
   if p_confirmar then
     v_quando_txt := case
       when p_repetir_min is null then
-        'uma vez, ' || to_char(v_alerta at time zone 'America/Sao_Paulo', 'DD/MM "as" HH24:MI')
+        'uma vez, ' || jarvis.data_br(v_alerta) || ' às ' || jarvis.hora_br(v_alerta)
+      when p_repetir_min = 1440 then
+        'todo dia às ' || jarvis.hora_br(v_alerta)
+          || ', até ' || jarvis.data_br(v_ate) || ' (' || v_n || ' avisos)'
+      when p_repetir_min = 60 then
+        'de hora em hora até ' || jarvis.data_br(v_ate) || ' às ' || jarvis.hora_br(v_ate)
+          || ' (' || v_n || ' avisos)'
       else
-        'de ' || p_repetir_min || ' em ' || p_repetir_min || ' min ate '
-          || to_char(v_ate at time zone 'America/Sao_Paulo', 'DD/MM "as" HH24:MI')
+        'de ' || p_repetir_min || ' em ' || p_repetir_min || ' min até '
+          || jarvis.data_br(v_ate) || ' às ' || jarvis.hora_br(v_ate)
           || ' (' || v_n || ' avisos)'
       end;
 
-    v_txt := '*Lembrete criado:* ' || btrim(p_titulo) || chr(10)
-          || 'Quando: ' || v_quando_txt || chr(10)
-          || '_Para desligar, mande aqui: jarvis para ' || v_handle || '_';
+    v_curto := btrim(p_titulo);
+    if length(v_curto) > 45 then
+      v_curto := btrim(left(v_curto, 45));
+      v_curto := left(v_curto, greatest(length(v_curto) - position(' ' in reverse(v_curto)), 20));
+    end if;
+
+    v_txt := '*Quando:* ' || v_quando_txt || chr(10)
+          || '_Para parar antes, é só me dizer aqui: "cancele o lembrete de ' || v_curto || '"._';
 
     insert into jarvis.compromissos
-      (tipo, titulo, alerta_em_utc, prioridade, mensagem_alerta, origem_texto,
+      (tipo, subtipo, titulo, quando_utc, alerta_em_utc, prioridade, mensagem_alerta, origem_texto,
        origem_msg_time, origem_autor, space_origem, space_origem_nome, fingerprint, serie)
     values
-      ('aviso', 'confirmacao do lembrete ' || v_handle, now(), 'normal', v_txt,
-       btrim(p_origem_texto), p_origem_msg_time, v_cfg->>'self_user_id',
+      ('aviso', 'lembrete_criado', 'Lembrete criado: ' || btrim(p_titulo), now(), now(), 'normal',
+       v_txt, btrim(p_origem_texto), p_origem_msg_time, v_cfg->>'self_user_id',
        v_space, v_space_nome, v_serie || ':ack', v_serie || ':ack');
   end if;
 
   return jsonb_build_object('acao', 'criou', 'id', v_id, 'serie', v_serie,
-                            'handle', v_handle, 'alerta_em', v_alerta,
+                            'alerta_em', v_alerta,
                             'repetir_min', p_repetir_min, 'repetir_ate', v_ate,
                             'ocorrencias_previstas', coalesce(v_n, 1),
-                            'rotulo', jarvis.rotulo('lembrete', v_prio));
+                            'rotulo', jarvis.rotulo('lembrete', v_prio, 'lembrete'));
 end $function$;
 
 -- ---------- postar_para_dono: texto livre, fatiado no teto do Chat ----------
 -- Usado para resposta a pedido (nao alerta agendado). Corta na
 -- ultima linha em branco que caiba, para nao partir paragrafo no meio.
+-- Sai por postar_chat(jsonb): app do Chat primeiro (se config.via_app),
+-- webhook de reserva.
 create or replace function jarvis.postar_para_dono(p_texto text, p_mencionar boolean default true,
                                                    p_origem text default 'externo')
  returns jsonb language plpgsql
@@ -135,6 +171,7 @@ declare
   v_self text; v_marca text := ''; v_teto int := 3600;
   v_resto text; v_pedaco text; v_corte int; v_nl text := chr(10);
   v_status int; v_partes int := 0; v_ok int := 0; v_sts int[] := '{}';
+  v_r jsonb; v_vias text[] := '{}';
 begin
   if coalesce(btrim(p_texto), '') = '' then
     raise exception 'texto vazio';
@@ -145,6 +182,8 @@ begin
     if coalesce(v_self, '') <> '' then v_marca := '<' || v_self || '> '; end if;
   end if;
 
+  -- nome de pessoa sempre real, nunca users/ID
+  begin p_texto := jarvis.corrigir_nomes(p_texto); exception when others then null; end;
   v_resto := btrim(p_texto, v_nl || ' ');
 
   while length(v_resto) > 0 loop
@@ -170,25 +209,31 @@ begin
     end if;
 
     begin
-      v_status := jarvis.postar_webhook(v_marca || v_pedaco);
+      v_r := jarvis.postar_chat(jsonb_build_object('text', v_marca || v_pedaco), p_origem);
+      v_status := coalesce((v_r->>'status')::int, -1);
+      if coalesce((v_r->>'ok')::boolean, false) and v_status not between 200 and 299 then
+        v_status := 200;
+      end if;
     exception when others then
       v_status := -1;
     end;
 
     v_partes := v_partes + 1;
     v_sts    := v_sts || v_status;
+    v_vias   := v_vias || coalesce(v_r->>'via', '?');
     if v_status between 200 and 299 then v_ok := v_ok + 1; end if;
   end loop;
 
   insert into jarvis.eventos (acao, motivo, run_id)
   values (case when v_ok = v_partes then 'disparou' else 'erro' end,
-          p_origem || ': ' || v_ok || '/' || v_partes || ' partes por webhook'
+          p_origem || ': ' || v_ok || '/' || v_partes || ' partes por '
+            || array_to_string(v_vias, ',')
             || case when p_mencionar then ' (marcando ele)' else '' end,
           p_origem);
 
   return jsonb_build_object('partes', v_partes, 'entregues', v_ok,
                             'status', to_jsonb(v_sts),
-                            'ok', v_ok = v_partes, 'via', 'webhook');
+                            'ok', v_ok = v_partes, 'via', array_to_string(v_vias, ','));
 end $function$;
 
 -- ---------- jarvis_saude: um olhar rapido sem abrir o SQL Editor ----------
@@ -212,13 +257,17 @@ as $function$
 -- Toda operacao que o cerebro na nuvem pode fazer esta neste `case`.
 -- O que nao esta aqui, ele nao consegue fazer -- e essa e a ideia.
 --
--- Tres ramos abaixo dependem de arquivos OPCIONAIS:
---   'gravar_consumo' / 'consumo'  -> 07-consumo.sql (recomendado)
---   'gravar_diario'  / 'diario'   -> nao vem neste repo (feature separada)
---   'guardar_google'              -> abandonada, ver CONSTRUIR.md secao 10b
--- Deixar o ramo aqui nao quebra nada: plpgsql so resolve a chamada
--- quando o ramo executa. Se voce nao aplicar o 07, remova os dois
--- primeiros ramos ou apenas nao os chame.
+-- Alguns ramos dependem de arquivos desta pasta que vem DEPOIS
+-- (plpgsql so resolve a chamada quando o ramo executa):
+--   'gravar_consumo' / 'consumo'             -> 07-consumo.sql
+--   'resolver_item'                          -> 09-chat-app.sql
+--   'chat_ler' / 'chat_conversa' / 'chat_get'-> 10-leitura-do-chat.sql
+-- E alguns chamam funcoes que NAO vem neste repo (produtos separados
+-- que dividem o mesmo banco). Chamar da "function does not exist";
+-- deixar o ramo nao quebra nada:
+--   'postar_resumo' / 'resumo_estado'        -> resumo matinal (card das 7h)
+--   'gravar_diario' / 'diario'               -> diario de sessoes de trabalho
+--   'guardar_google'                         -> abandonada, ver CONSTRUIR.md secao 10b
 create or replace function public.jarvis_rpc(p_token text, p_fn text, p_args jsonb default '{}'::jsonb)
  returns jsonb language plpgsql security definer set search_path to 'public','extensions'
 as $function$
@@ -231,14 +280,24 @@ begin
   update jarvis.credencial set ultimo_uso = now(), usos = usos + 1 where nome = 'nuvem';
 
   case p_fn
+    when 'avisos_da_conversa' then
+      v_out := coalesce((select jsonb_agg(to_jsonb(a))
+                           from jarvis.avisos_da_conversa(p_args->>'thread') a), '[]'::jsonb);
     when 'prompt' then
       v_out := (select jsonb_build_object('versao', versao, 'corpo', corpo)
                   from jarvis.prompt where nome = coalesce(p_args->>'nome','nuvem'));
     when 'tem_trabalho' then v_out := jarvis.tem_trabalho(coalesce((p_args->>'dias')::int, 14));
+    when 'chat_ler' then
+      v_out := jarvis.chat_ler((p_args->>'desde')::timestamptz,
+                               coalesce((p_args->>'max_espacos')::int, 40));
+    when 'chat_conversa' then
+      v_out := jarvis.chat_conversa(p_args->>'space', p_args->>'thread',
+                                    coalesce((p_args->>'limite')::int, 10));
+    when 'chat_get' then v_out := jarvis.chat_get(p_args->>'caminho');
     when 'calendario' then v_out := jarvis.calendario(coalesce((p_args->>'dias')::int, 14));
     when 'tentar_lock' then v_out := jarvis.tentar_lock(p_args->>'run_id', coalesce((p_args->>'minutos')::int,20));
     when 'soltar_lock' then v_out := jarvis.soltar_lock(p_args->>'run_id');
-    when 'gravar_mensagens' then v_out := jarvis.gravar_mensagens(p_args->'msgs');
+    when 'gravar_mensagens' then v_out := jarvis.gravar_mensagens(p_args->'msgs', p_args->>'run_id');
     when 'definir_turno' then v_out := jarvis.definir_turno();
     when 'briefing' then v_out := jarvis.briefing(coalesce(p_args->>'texto_novo',''), (p_args->>'top')::int);
     when 'podar' then v_out := jarvis.podar(p_args->>'run_id');
@@ -248,7 +307,8 @@ begin
         p_args->>'mensagem_alerta', (p_args->>'quando')::timestamptz, p_args->>'descricao',
         p_args->>'space_origem', p_args->>'space_origem_nome',
         (p_args->>'origem_msg_time')::timestamptz, p_args->>'origem_autor',
-        p_args->>'calendar_event_id', coalesce(p_args->>'prioridade','normal'));
+        p_args->>'calendar_event_id', coalesce(p_args->>'prioridade','normal'),
+        p_args->>'subtipo', p_args->>'urgencia_motivo');
     when 'encerrar_compromisso' then
       v_out := jarvis.encerrar_compromisso((p_args->>'id')::bigint, p_args->>'status',
                                            p_args->>'motivo', p_args->>'run_id');
@@ -257,10 +317,30 @@ begin
         (p_args->>'alerta_em')::timestamptz, (p_args->>'repetir_min')::int,
         (p_args->>'repetir_ate')::timestamptz, p_args->>'mensagem_alerta',
         coalesce(p_args->>'prioridade','normal'), (p_args->>'origem_msg_time')::timestamptz,
-        p_args->>'run_id', coalesce((p_args->>'confirmar')::boolean, true));
+        p_args->>'run_id', coalesce((p_args->>'confirmar')::boolean, true),
+        p_args->>'urgencia_motivo');
     when 'encerrar_serie' then
       v_out := jarvis.encerrar_serie(p_args->>'serie', p_args->>'motivo', p_args->>'run_id');
+    when 'achar_serie' then v_out := jarvis.achar_serie(p_args->>'texto');
     when 'pedidos_ativos' then v_out := jarvis.pedidos_ativos();
+    when 'categorias' then
+      v_out := (select jsonb_agg(jsonb_build_object('subtipo', subtipo, 'tipo', tipo,
+                         'emoji', emoji, 'nome', nome, 'exige_hora', exige_hora, 'molde', molde)
+                       order by ordem) from jarvis.categorias);
+    when 'dms_a_resolver' then
+      v_out := jarvis.dms_a_resolver(p_args->'ids', coalesce((p_args->>'limite')::int, 6));
+    when 'dm_registrar' then
+      v_out := jarvis.dm_registrar(p_args->>'space_id', p_args->>'pessoa_nome', p_args->>'pessoa_id');
+    when 'dm_espaco' then
+      v_out := jsonb_build_object('space_id', jarvis.dm_espaco(p_args->>'pessoa'));
+    when 'auditoria' then
+      v_out := jarvis.auditoria(coalesce((p_args->>'horas')::int, 24), p_args->>'run_id');
+    when 'anotar_defeito' then
+      perform jarvis.anotar_defeito(coalesce(p_args->>'onde','cerebro'), p_args->>'regra',
+                coalesce(p_args->>'gravidade','suspeito'), p_args->'detalhe', p_args->>'run_id');
+      v_out := jsonb_build_object('ok', true);
+    when 'postar_resumo' then
+      v_out := jarvis.postar_resumo_card(p_args, coalesce(p_args->>'origem', 'resumo7h'));
     when 'postar_para_dono' then
       v_out := jarvis.postar_para_dono(p_args->>'texto',
                  coalesce((p_args->>'mencionar')::boolean, true),
@@ -277,11 +357,18 @@ begin
     when 'fechar_run' then
       v_out := jarvis.fechar_run(p_args->>'run_id', (p_args->>'ate')::timestamptz,
                                  coalesce(p_args->'resultado','{}'::jsonb));
+    when 'resumo_estado' then
+      v_out := jarvis.resumo_estado(coalesce((p_args->>'dias')::int, 14));
+    when 'resolver_item' then
+      v_out := jarvis.resolver_item(p_args->>'token', coalesce(p_args->>'acao', 'resolver'));
     when 'saude' then v_out := public.jarvis_saude();
     when 'entregar_agora' then v_out := jarvis.entregar('nuvem');
     when 'catalogo_rotulos' then
-      v_out := (select jsonb_object_agg(t, jarvis.rotulo(t,'normal')) from unnest(
-        array['reuniao','prazo','promessa','pergunta_aberta','mencao','conflito','aviso','lembrete']) t);
+      v_out := (select jsonb_object_agg(subtipo, emoji) from jarvis.categorias);
+    when 'guardar_google' then v_out := jarvis.guardar_google(p_args);
+    when 'gravar_diario' then v_out := jarvis.gravar_diario(p_args);
+    when 'diario' then v_out := jarvis.diario(coalesce((p_args->>'horas')::int, 30),
+                                              coalesce((p_args->>'limite')::int, 40));
     when 'gravar_consumo' then v_out := jarvis.gravar_consumo(p_args);
     when 'consumo' then v_out := jarvis.consumo_resumo(coalesce((p_args->>'dias')::int, 7));
     else v_out := jsonb_build_object('erro','operacao nao permitida: ' || coalesce(p_fn,'(nula)'));
@@ -292,3 +379,8 @@ end $function$;
 -- a porta e chamada com o token pelo PostgREST; o schema jarvis
 -- continua fechado para anon/authenticated (ver 01).
 grant execute on function public.jarvis_rpc(text, text, jsonb) to anon, authenticated;
+
+-- jarvis_saude so para service_role (o painel do Supabase). Pelo
+-- cerebro, ela sai pelo ramo 'saude' da porta.
+revoke all on function public.jarvis_saude() from public, anon, authenticated;
+grant execute on function public.jarvis_saude() to service_role;
