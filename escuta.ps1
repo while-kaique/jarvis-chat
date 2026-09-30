@@ -1,7 +1,7 @@
 # Jarvis Chat - o passo que PENSA.
 # Agendador de Tarefas do Windows, a cada 15 minutos.
 # Le o Google Chat + Calendar, decide, e agenda alertas em jarvis.compromissos.
-# Nao entrega nada: quem entrega e o dispara.ps1, de 5 em 5 minutos.
+# Nao entrega nada: quem entrega e o cron do banco (jarvis.entregar), de 5 em 5 min.
 
 $ErrorActionPreference = "Stop"
 
@@ -57,22 +57,29 @@ $log = Join-Path $logDir "$stamp.log"
 
 try {
     $prompt = Get-Content (Join-Path $base "prompt-escuta.md") -Raw -Encoding utf8
-    # O caminho vai explicito para nao depender do diretorio de trabalho do agente.
+    # O caminho vai explicito porque o cwd do agente e a pasta PAI (Set-Location abaixo),
+    # e "falhas.jsonl" sozinho nao resolveria.
     $prompt = $prompt + "`n`n---`n`nSeu run_id desta execucao e: ``$runId``. Use exatamente esse valor em todo p_run_id e no lock."
     $prompt = $prompt + "`n`nO arquivo de falhas do Passo 1b e: ``$falhas``"
 
     # send_message fica FORA de proposito: o Jarvis nunca fala direto, so agenda.
     $tools = @(
         "mcp__claude_ai_Supabase__execute_sql",
-        "mcp__google-workspace__search_messages",
+        # search_messages e list_spaces sairam em 29/09: a varredura agora e jarvis.chat_ler
+        # (id real de todo espaco). search_messages gravava grupo novo sem id.
         "mcp__google-workspace__get_messages",
-        "mcp__google-workspace__list_spaces",
+        "mcp__google-workspace__download_chat_attachment",
         "mcp__google-workspace__get_events",
         "Read",
         "Write"
     ) -join ","
 
-    Set-Location $base
+    # O google-workspace sobe via uvx e as vezes passa do tempo padrao de partida
+    # do MCP (24/09 17h16: run abortada por "timeout" no Chat). 90 s de folga.
+    $env:MCP_TIMEOUT = "90000"
+
+    # cwd = a pasta PAI do projeto, como na instalacao original (o prompt conta com isso).
+    Set-Location (Split-Path $base -Parent)
 
     $prompt | & claude -p --model sonnet --allowedTools $tools --permission-mode acceptEdits |
         Tee-Object -FilePath $log
