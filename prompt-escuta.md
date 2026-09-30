@@ -46,9 +46,20 @@ um caminho relativo: seu diretório de trabalho é a pasta *pai* do projeto.
 nada.** É o caso normal, e é o que acontece quase todo dia.
 
 Se tiver linha, cada uma é um JSON com `quando`, `run_id`, `tipo`
-(`saida_erro` ou `excecao`), `detalhe` e `log`. O arquivo pode começar com um BOM — ignore.
+(`saida_erro`, `excecao` ou `sem_internet`), `detalhe` e `log`. O arquivo pode começar
+com um BOM — ignore.
 
-**Um aviso só, com todas as falhas juntas.** Nunca um por linha.
+**Você é a cópia rápida, não o Jarvis inteiro.** A rotina na nuvem roda com o PC
+desligado, e o `jarvis.vigiar()` avisa se *todos* os cérebros pararem por mais de 45 min.
+Falha só desta máquina não deixa ele cego. Por isso, antes de avisar:
+
+1. **Descarte as linhas `sem_internet`** sem aviso nenhum. PC sem rede não é defeito do
+   Jarvis, e ele não tem o que fazer. Se só sobrarem essas, esvazie o arquivo e siga.
+2. **Veja se a nuvem cobriu.** Leia `valor->>'ultima_run_utc'` da chave `heartbeat` em
+   `jarvis.estado` (antes de esta run gravar o dela). Se for **depois** do `quando` da
+   última falha, a nuvem continuou rodando: a prioridade é `normal` sempre.
+
+**Um aviso só, com todas as falhas que sobraram.** Nunca um por linha.
 
 ```sql
 select jarvis.upsert_compromisso(
@@ -62,13 +73,15 @@ select jarvis.upsert_compromisso(
 );
 ```
 
-- **`p_prioridade`**: `normal` até 2 falhas, `alta` de 3 pra cima. Três falhas seguidas
-  não é blip — é o cérebro rodando pela metade sem ninguém perceber.
+- **`p_prioridade`**: `normal` se a nuvem cobriu (item 2 acima) ou se foram até 2 falhas.
+  `alta` só com 3 ou mais **e** a nuvem sem rodar depois delas.
 - **Linha 1:** `A escuta local falhou <N>x, a última <DD/MM> às <hora>.` A hora sai do
   campo `quando` da última linha, que já vem no fuso dele — **não** converta.
-- **Linha 2:** o que isso custou e onde olhar. Ex.: `Nenhuma mensagem foi perdida (o
-  watermark não andou e a run seguinte reprocessou), mas ele ficou cego por <N x 15> min.
-  O erro está em logs\<nome do arquivo do campo log>.`
+- **Linha 2:** o que isso custou e onde olhar. Se a nuvem cobriu: `A nuvem continuou
+  rodando, então nada ficou sem leitura. O erro está em logs\<arquivo do campo log>.`
+  Se não cobriu: `Nenhuma mensagem foi perdida (o watermark não andou e a run seguinte
+  reprocessou), mas ninguém leu o Chat por <N x 15> min. O erro está em logs\<arquivo>.`
+  **Nunca** escreva "cego" se a nuvem cobriu.
 - Se as falhas forem todas do mesmo `tipo`, diga qual em uma expressão de gente:
   `saida_erro` = *"o Claude saiu com erro"*, `excecao` = *"nem chegou a rodar"*.
 

@@ -78,7 +78,14 @@ try {
         Tee-Object -FilePath $log
 
     if ($LASTEXITCODE -ne 0) {
-        Anotar-Falha "saida_erro" "o claude saiu com codigo $LASTEXITCODE"
+        # Sem internet nao e defeito do Jarvis: a nuvem continua rodando e o vigia do
+        # banco pega se ela tambem parar. 30/09: 6 quedas de DNS viraram aviso "alta".
+        $saida = Get-Content $log -Raw -ErrorAction SilentlyContinue
+        if ($saida -match "ENOTFOUND|ECONNREFUSED|ETIMEDOUT|ECONNRESET|Can't reach the API") {
+            Anotar-Falha "sem_internet" "o PC estava sem internet"
+        } else {
+            Anotar-Falha "saida_erro" "o claude saiu com codigo $LASTEXITCODE"
+        }
         Write-Output "FALHOU com codigo $LASTEXITCODE - falha enfileirada"
     }
 }
