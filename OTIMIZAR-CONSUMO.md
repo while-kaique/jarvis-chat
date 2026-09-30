@@ -26,7 +26,7 @@ custariam US$ 8,10 em vez de US$ 0,81. O que puxa os três pedaços é a mesma c
 **nº de passos × tamanho do que cada passo carrega**, porque cada passo relê o contexto
 inteiro da conversa.
 
-**O desperdício real**, medido no log da run de 05h37 de 03/09 (`cse_01A1XwezPmMDRHABd1z4J944`):
+**O desperdício real**, medido no log da run de 05h37 de 03/09 (`cse_<id-da-sessao>`):
 zero mensagem nova, e ainda assim **19 passos e 126 segundos**. No passo 8 ela já sabia que
 não havia nada (`espaços ativos: 0`) e mesmo assim buscou:
 

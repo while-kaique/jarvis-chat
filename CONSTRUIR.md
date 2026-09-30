@@ -17,19 +17,20 @@ Chat privado dela. Também cancela sozinho o alerta quando a pessoa muda de idei
 mantém memória de longo prazo dos assuntos para poder decidir sobre coisa de um mês atrás.
 
 ```
-                 +---------------------------------------------+
-  Google Chat -->|  CEREBRO  - pensa e agenda                  |
-  Google Cal. -->|  a) rotina na nuvem, 1x/hora (o piso)       |
-                 |  b) escuta.ps1 local, 15 min (caminho rapido)|
-                 |  os dois compartilham um lock               |
-                 +------------------+--------------------------+
+                 +----------------------------------------------+
+  Google Chat -->|  CEREBRO  - pensa e agenda, a cada 15 min    |
+  Google Cal. -->|  a) 4 rotinas na nuvem, :07 :22 :37 :52      |
+   (lidos pelo   |  b) escuta.ps1 local, 15 min (redundancia)   |
+    banco)       |  todos compartilham um lock                  |
+                 +------------------+---------------------------+
                                     |  grava em jarvis.compromissos
                                     v
-                 +---------------------------------------------+
+                 +----------------------------------------------+
   Google Chat <--|  ENTREGA - cron dentro do Supabase, 5 min    |
                  |  jarvis.entregar() + jarvis.vigiar()         |
-                 |  posta pelo webhook do espaco. Zero LLM.     |
-                 +---------------------------------------------+
+                 |  posta como o app "Jarvis", com botoes;      |
+                 |  webhook do espaco como reserva. Zero LLM.   |
+                 +----------------------------------------------+
 ```
 
 **Por que a entrega mora no banco.** É o único relógio que acerta o minuto e não depende
@@ -37,15 +38,26 @@ de máquina ligada. Um tick de 15 min cai em 10:15 e 10:30 — nunca acerta "10 
 reunião das 10:30". E não custa nada: `jarvis.entregar()` conta os vencidos antes de tocar
 em rede, então nas ~280 execuções diárias vazias ela sai sem gastar.
 
-**Por que o cérebro é duplo.** Rotina na nuvem tem **mínimo de 1 hora** de intervalo — o
-servidor recusa `*/15` com "cron interval too short". Então: a nuvem é o piso que funciona
-com o computador desligado, e o script local dá 15 min de frescor quando ele está ligado.
-`jarvis.tentar_lock` arbitra: quem chega primeiro roda, o outro aborta em paz.
+**Por que quatro rotinas e mais um cérebro local.** Rotina na nuvem tem **mínimo de 1
+hora** de intervalo — o servidor recusa `*/15` com "cron interval too short". Então são
+quatro rotinas horárias defasadas (`:07`, `:22`, `:37`, `:52`), que juntas dão **15
+minutos com o computador desligado**. O script local roda também de 15 em 15 quando o PC
+está ligado: é redundância e caminho rápido, não o piso. `jarvis.tentar_lock` arbitra:
+quem chega primeiro roda, o outro aborta em paz.
+
+**Por que o banco lê o Google, e não o cérebro.** Desde 24/09/2026 o ambiente das rotinas
+na nuvem bloqueia script que troca refresh token por token de acesso ("Credential
+Materialization"). A leitura do Chat (`jarvis.chat_ler`) e do Calendar
+(`jarvis.calendario`) mora no banco, com a credencial no Vault; os cérebros só chamam a
+função. Seção 19.
 
 **O cérebro nunca posta.** `send_message` fica fora do allowlist de propósito. Tudo que
 precisa chegar à pessoa é uma linha em `jarvis.compromissos` com `alerta_em_utc`. Uma
 porta de saída só, e deduplicação de graça pelo `fingerprint`. "Avisa agora" =
 `alerta_em_utc` igual a `now()`, entregue em no máximo 5 minutos.
+
+**Quem posta é o app "Jarvis"**, com botões que resolvem o aviso dentro do Chat; o webhook
+do espaço é a reserva automática (seção 20). O aviso chegar importa mais que o botão.
 
 ---
 
@@ -120,7 +132,7 @@ Ative **três** APIs — sem elas as chamadas voltam com `403 SERVICE_DISABLED`:
 |---|---|---|
 | Google Chat API | ler espaços e mensagens, postar | tudo |
 | Google Calendar API | a agenda que o banco busca | `jarvis.calendario` volta vazia |
-| People API | trocar `users/123…` pelo nome | o alerta diz "users/1078…" em vez de "Luis" |
+| People API | trocar `users/123…` pelo nome | o alerta diz "users/1078…" em vez de "Ana" |
 
 Pelo console: **APIs e serviços → Biblioteca**, busque cada uma, **Ativar**. Se tiver
 `gcloud` logado na conta certa, é uma linha:
@@ -195,9 +207,14 @@ https://www.googleapis.com/auth/calendar.events
 https://www.googleapis.com/auth/contacts.readonly
 ```
 
-**Este arquivo é também de onde sai o `GOOGLE_CHAT_REFRESH_TOKEN` do cérebro na nuvem**
-(seção 10c) e o segredo `jarvis_google_chat` do Vault. Não precisa de OAuth Playground nem
-de script próprio: o refresh token já está aqui, com escopo de Chat, e é de longa duração.
+**Este arquivo é também de onde sai o segredo `jarvis_google_chat` do Vault** — o JSON
+`{"client_id", "client_secret", "refresh_token"}` com que o banco lê Chat, Calendar e
+People. Não precisa de OAuth Playground nem de script próprio: o refresh token já está
+aqui, com escopo de Chat, e é de longa duração. O `sincronizar-google.ps1` (seção 19.3)
+copia este arquivo para o Vault sempre que o refresh token muda.
+
+(Até 24/09/2026 o mesmo refresh token ia também como `GOOGLE_CHAT_REFRESH_TOKEN` nas
+variáveis do ambiente da nuvem. Não vai mais: seção 19.)
 
 ### 1b.5 — A armadilha que custou uma tarde
 
@@ -213,9 +230,13 @@ falando como a conta errada.
 
 ## 1c. O webhook do espaço de alerta
 
-A entrega não usa OAuth: usa um **webhook de entrada** criado dentro do próprio espaço do
-Google Chat. É uma URL com `key=` e `token=` embutidos, sem renovação, sem token para
-expirar.
+A entrega não usa a credencial da pessoa: usa um **webhook de entrada** criado dentro do
+próprio espaço do Google Chat. É uma URL com `key=` e `token=` embutidos, sem renovação,
+sem token para expirar.
+
+Desde 22/09/2026 o caminho principal é o **app de Chat "Jarvis"** (seção 20), que posta com
+botões de ação. O webhook continua obrigatório: é para onde `jarvis.postar_lote` cai
+sozinho quando o app falha, e foi o único caminho até o app existir.
 
 ### 1c.1 — Criar (na interface do Chat)
 
@@ -261,20 +282,31 @@ Confira sem imprimir o segredo:
 select name, description from vault.secrets where name like 'jarvis%';
 ```
 
-Devem existir dois: `jarvis_chat_webhook` e `jarvis_google_chat` (o JSON de OAuth do
-caminho reserva).
+Numa instalação completa são cinco:
+
+| segredo | o que é | quem lê |
+|---|---|---|
+| `jarvis_chat_webhook` | URL do webhook do espaço | `jarvis.postar_webhook` (reserva da entrega) |
+| `jarvis_google_chat` | JSON OAuth da pessoa | `jarvis.token_google()` → `chat_ler`, `calendario`, `nome_pessoa`, reações |
+| `jarvis_chat_sa` | chave JSON da conta de serviço do app | só a Edge `chat-post`, via `public.jarvis_chat_credenciais` |
+| `jarvis_chat_post_token` | token interno banco → `chat-post`, gerado no próprio banco | `jarvis.postar_como_app` |
+| `jarvis_sync_google_hash` | sha256 do token do PC que pode atualizar `jarvis_google_chat` | `public.jarvis_sincronizar_google` |
+
+Os dois primeiros são o mínimo para o agente ler e avisar; os três últimos entram com o app
+(seção 20) e com o `sincronizar-google.ps1` (seção 19.3).
 
 ### 1c.3 — Por que webhook, e não a API com a credencial dele
 
 Já está na seção 10, mas o motivo cabe aqui também porque é o que decide o desenho: postando
 com a credencial da própria pessoa, a marcação `<users/ID>` **aparece na mensagem e não
 notifica o celular** — o Google não notifica alguém de uma mensagem que ele mesmo mandou.
-Pelo webhook a mensagem vem de outra identidade ("Jarvis"), e a marcação vibra.
+Pelo webhook a mensagem vem de outra identidade ("Jarvis"), e a marcação vibra. O app de
+Chat vale pela mesma razão: posta como o app, não como a pessoa.
 
-⚠️ **Risco aberto, de 01/09/2026:** existe um webhook do Google Chat em claro dentro de
-`godaily/workflows_n8n/alerta_gastos.json` (espaço `spaces/AAQAWcs3y9k`), com `key` e
-`token`. Quem tem o arquivo pode postar naquele espaço. Não repita o padrão, e vale apagar
-aquele webhook e recriar.
+⚠️ **Não guarde URL de webhook em arquivo de projeto.** Neste build apareceu um webhook do
+Chat em claro dentro de um arquivo de workflow de outro sistema, com `key` e `token`:
+quem tem o arquivo posta naquele espaço. Se isso acontecer com você, apague o webhook e
+recrie — a URL vazada não tem como ser revogada de outro jeito.
 
 ---
 
@@ -929,10 +961,12 @@ end $$;
 ## 5b. As migracoes seguintes
 
 > **Para instalar, use [`sql/00-fundacao/`](sql/00-fundacao/).** Aquela pasta e o estado
-> atual do banco em 8 arquivos ordenados — schema, funcoes, entrega, porta e seed —
-> e inclui tudo que as 17 migracoes abaixo fizeram. As secoes 3 a 5 deste arquivo
-> transcrevem as tres primeiras migracoes com o raciocinio de cada decisao: leia para
-> **entender**, aplique a pasta para **montar**. Nao faca os dois.
+> atual do banco em arquivos numerados — aplique todos, em ordem numerica; a tabela com o
+> que cada um traz esta no `README.md` dela. Ela inclui tudo que as migracoes abaixo
+> fizeram, e tambem as de depois de 04/09 (secoes 19 em diante e os `sql/*.sql` datados).
+> As secoes 3 a 5 deste arquivo transcrevem as tres primeiras migracoes com o raciocinio
+> de cada decisao: leia para **entender**, aplique a pasta para **montar**. Nao faca os
+> dois.
 
 As migracoes 1 a 3 estao acima na integra porque sao a fundacao: schema, invariantes e o
 ciclo da run. As seguintes nunca foram transcritas aqui — eram ~20 KB de SQL que iriam
@@ -962,6 +996,10 @@ Na ordem em que foram aplicadas:
 | `jarvis_calendario_pelo_banco` | `jarvis.calendario` e a porta atualizada |
 | `jarvis_entrega_em_lote` | vários vencidos viram uma mensagem só |
 
+Depois de 04/09/2026 as mudanças passaram a sair com um arquivo datado em `sql/` (o nome
+diz o dia e o defeito, e o cabeçalho diz o porquê). As que mudam comportamento para quem
+instala estão resumidas nas seções 19 a 24.
+
 Para reconstruir num projeto novo **nao siga esta lista** — o historico de migracoes vive
 no projeto Supabase de quem construiu, e voce nao tem acesso a ele. Aplique
 `sql/00-fundacao/` na ordem numerica. A lista acima serve para saber *quando* cada peca
@@ -970,8 +1008,8 @@ entrou e por que. Para inspecionar uma funcao especifica no ar,
 
 ## 6. Seed do estado
 
-> Prefira **`sql/00-fundacao/08-seed.sql`**, que e este seed atualizado e comentado. O
-> bloco abaixo cria 7 chaves; sao **9** as necessarias. Faltam `visto` e `ultima_entrega`,
+> Prefira **o seed de `sql/00-fundacao/`** (o README da pasta diz qual arquivo), que e
+> este seed atualizado e comentado. O bloco abaixo cria 7 chaves; sao **9** as necessarias. Faltam `visto` e `ultima_entrega`,
 > e a falta e silenciosa: `fechar_run` e `entregar` fazem `update` nelas, e um `update` em
 > linha inexistente nao da erro — so nao grava. Sem `visto`, `tem_trabalho` acha que nada
 > mudou desde a run anterior e o cerebro nunca trabalha.
@@ -1111,22 +1149,24 @@ zero no final.
 
 ## 8. Os dois prompts do cérebro
 
-São dois arquivos, com a mesma lógica e fontes de dados diferentes:
+São dois arquivos, com a mesma lógica e quase as mesmas fontes de dados:
 
-- **`prompt-escuta.md`** — o cérebro local. Lê Chat e Calendar pelo MCP `google-workspace`
-  e o banco pelo MCP do Supabase. Copie literalmente, trocando o email da pessoa e o id do
-  projeto.
-- **`prompt-nuvem.md`** — o cérebro da nuvem. Lê o Chat pela API REST (credenciais do
-  ambiente), o Calendar pelo conector, e o banco pela porta `jarvis_rpc`. Este é a fonte
-  de edição da tabela `jarvis.prompt`; depois de mudar o arquivo, suba o corpo para o
-  banco.
+- **`prompt-escuta.md`** — o cérebro local. Lê o Chat por `jarvis.chat_ler` (desde
+  29/09/2026; antes varria com `search_messages`, que não devolve id de espaço e gravava
+  grupo novo sem id), aprofunda conversa com `get_messages` e lê o Calendar por
+  `get_events`, os dois do MCP `google-workspace`. Fala com o banco pelo MCP do Supabase.
+  Copie literalmente, trocando o email da pessoa e o id do projeto.
+- **`prompt-nuvem.md`** — o cérebro da nuvem. Lê o Chat por `chat_ler` e o Calendar por
+  `calendario`, os dois pela porta `jarvis_rpc`: nenhuma credencial do Google passa pela
+  rotina. Este é a fonte de edição da tabela `jarvis.prompt`; depois de mudar o arquivo,
+  suba o corpo para o banco.
 
 Estrutura dos dois, para você entender o que não pode sair:
 
 | passo | o que faz | por que existe |
 |---|---|---|
 | 1 | lock + watermark + config + `now()` | lê **desde o watermark**, nunca "últimos 15 min" |
-| 2 | ler o Chat, **uma** varredura | são ~291 espaços; varrer um por um dá 291 chamadas |
+| 2 | ler o Chat: **uma** chamada a `chat_ler(desde)` | são ~330 espaços; o banco lista todos, fica com os que tiveram movimento na janela e lê só esses |
 | 3 | ler o Calendar, 14 dias | o card de convite no Chat é pouco confiável |
 | 4 | gravar cru + turno + briefing + podar, numa chamada | um round-trip só |
 | 5 | decidir: 8 situações | é o miolo |
@@ -1136,7 +1176,8 @@ Estrutura dos dois, para você entender o que não pode sair:
 Três coisas no prompt que parecem detalhe e não são:
 
 1. **`p_ate` do `fechar_run` tem que ser o `now()` do passo 1**, não o horário do fim da
-   run. Mensagem que chegou enquanto a run rodava precisa entrar na próxima janela.
+   run. Mensagem que chegou enquanto a run rodava precisa entrar na próxima janela. Desde
+   28/09/2026 o banco garante isso sozinho (seção 22.4) — mas o prompt continua pedindo.
 2. **`p_origem_texto` é citação literal e obrigatória.** A função recusa vazio. A regra no
    prompt é: se não consegue apontar a frase exata, não crie — está adivinhando.
 3. **Em `p_texto_novo` do briefing vão as palavras das mensagens novas concatenadas.** É
@@ -1164,19 +1205,32 @@ Copie de `escuta.ps1` nesta pasta. Pontos que não são estilo:
 - **Duas redes, não uma.** O `falhas.jsonl` pega a falha isolada, que se cura sozinha na
   run seguinte e some sem rastro. O `jarvis.vigiar()` pega o caso grave — nenhuma run
   rodando há mais de 45 min, quando não há quem drene o arquivo. Uma não cobre a outra.
+- **Falha local só grita se a nuvem também parou** (desde 30/09/2026). Numa manhã sem
+  internet, seis runs caíram com `ENOTFOUND` e o Passo 1b gerou "Escuta local falhou 6x",
+  prioridade alta, dizendo que o Jarvis tinha ficado cego — falso: a nuvem rodou três vezes
+  no meio. Agora:
+  - o `escuta.ps1` marca erro de rede (`ENOTFOUND`, `ECONNREFUSED`, `ETIMEDOUT`,
+    `ECONNRESET`, "Can't reach the API") como `tipo: sem_internet`;
+  - o Passo 1b **descarta `sem_internet` calado** — PC sem rede não é defeito do Jarvis e
+    a pessoa não tem o que fazer;
+  - o que sobra só vira prioridade `alta` se o `heartbeat` **não andou** depois da última
+    falha, ou seja, se a nuvem também não cobriu. Senão sai `normal`.
+- **`MCP_TIMEOUT=90000`.** O `google-workspace` sobe via `uvx` e às vezes passa dos 30 s
+  padrão de partida do MCP; a run abortava por "timeout" no Chat.
 - Rotação em 30 logs.
 
 ```powershell
 $tools = @(
     "mcp__claude_ai_Supabase__execute_sql",
-    "mcp__google-workspace__search_messages",
+    # search_messages e list_spaces sairam em 29/09: a varredura e jarvis.chat_ler
     "mcp__google-workspace__get_messages",
-    "mcp__google-workspace__list_spaces",
+    "mcp__google-workspace__download_chat_attachment",
     "mcp__google-workspace__get_events",
     "Read",
     "Write"
 ) -join ","
 
+$env:MCP_TIMEOUT = "90000"
 $prompt | & claude -p --model sonnet --allowedTools $tools --permission-mode acceptEdits |
     Tee-Object -FilePath $log
 ```
@@ -1185,15 +1239,19 @@ $prompt | & claude -p --model sonnet --allowedTools $tools --permission-mode acc
 
 ## 10. A entrega, dentro do banco
 
-Três funções, todas `security definer` e sem permissão para `anon`:
+As funções da entrega, todas `security definer` e sem permissão para `anon`:
 
-- **`jarvis.postar_webhook(texto)`** — o caminho preferido. Lê a URL do webhook do Vault
+- **`jarvis.postar_lote(...)`** — a porta do disparo desde 22/09/2026. Com
+  `config.via_app = true`, posta como o app "Jarvis" por `jarvis.postar_como_app` (card com
+  botões de ação, seção 20); se o app falhar, cai sozinha para o webhook, com botão de link;
+  se o card falhar, cai para texto puro. **O aviso chegar importa mais que o botão.**
+- **`jarvis.postar_webhook(texto)`** — o caminho de reserva. Lê a URL do webhook do Vault
   (segredo `jarvis_chat_webhook`) e faz um POST. Sem autenticação, sem token para renovar.
-- **`jarvis.postar_chat(space, texto, token)`** — reserva, via OAuth. Precisa de
-  `jarvis.token_google()`, que troca o refresh token do Vault por um token de acesso.
-- **`jarvis.entregar(origem)`** — a que o cron chama. Escolhe webhook se existir (e então
-  nem renova token), monta o rótulo, e marca `status='disparado'` na mesma transação da
-  seleção. É isso que garante uma entrega por compromisso, sem janela de corrida.
+- **`jarvis.postar_chat(...)`** — texto avulso (confirmações, avisos do próprio Jarvis):
+  app primeiro, webhook de reserva.
+- **`jarvis.entregar(origem)`** — a que o cron chama. Monta o rótulo, entrega pelo
+  `postar_lote`, e marca `status='disparado'` na mesma transação da seleção. É isso que
+  garante uma entrega por compromisso, sem janela de corrida.
 
 **Entrega em lote.** Tudo que vence no mesmo tique sai numa **mensagem só**, com um
 cabeçalho `*N avisos agora*` e um aviso por bloco, separados por linha em branco. Dois
@@ -1236,6 +1294,21 @@ posição; e prioridade com **dois níveis só**, marcando apenas o urgente — 
 prioridade" não informa nada e gasta a atenção, e três níveis é onde o modelo chuta. O
 prompt tem instrução explícita de **não escrever emoji** no texto: se escrever, sai duplo.
 
+**O formato mudou em 22/09/2026.** O catálogo cresceu para as 19 categorias de
+`jarvis.categorias` (por `subtipo`: reunião, prazo, pergunta, lembrete, sumiu da agenda,
+recibo de item fechado…). O emoji saiu da frente do título e subiu para a linha da
+marcação; no lugar dele entrou o **rótulo da categoria** (`jarvis.categorias.rotulo`, uma
+palavra — "Pergunta", "Prazo", "Reunião"; o padrão é "Alerta"):
+
+```
+@Seu Nome 🔴 ❓
+*Pergunta: Ana travada sem o acesso ao painel*
+```
+
+Com um aviso só, a marcação e o emoji ficam numa linha. Com mais de um, a marcação fica
+sozinha, vem `*N avisos agora*` e cada aviso abre com a sua linha de emoji. A mesma tabela
+guarda os botões de cada categoria (`jarvis.categorias.botoes`, seção 20.2).
+
 ### O vigia
 
 `jarvis.vigiar()` roda no mesmo cron. É o único lugar de onde se pode notar que o cérebro
@@ -1246,10 +1319,20 @@ postagem em 2 horas (token revogado, webhook apagado).
 Três travas contra spam: só entre 8h e 22h (fora disso a pessoa não age e o aviso queima),
 fingerprint por hora (no máximo 1 aviso por hora de apagão), e silêncio no fim de semana.
 
+### A auditoria diária
+
+Um segundo `cron.job`, `jarvis-auditoria`, roda uma vez por dia às 7h35 de Brasília
+(`35 10 * * *` em UTC) e chama `jarvis.avisar_defeitos(24, ...)`: junta os defeitos que as
+funções e os cérebros anotaram nas últimas 24h (`jarvis.anotar_defeito` — mensagem gravada
+sem id de chat, aviso de reunião citando choque já resolvido…) num aviso só. É o que fez
+aparecer, repetido, o defeito "mensagens sem o id do chat" que levou à seção 19.
+
 ## 10b. O cérebro na nuvem — e os tres limites da plataforma
 
 Sao **quatro** rotinas `RemoteTrigger` horarias, defasadas: `:07`, `:22`, `:37`, `:52`.
-Modelo Sonnet, ambiente com as credenciais de Chat, conector do Supabase anexado.
+Juntas dao **15 minutos de cadencia com o PC desligado** — a nuvem e o cerebro principal,
+e o local (secao 11) e redundancia. Modelo Sonnet, conector do Supabase anexado, e
+**nenhuma credencial do Google no ambiente** (limite 4, abaixo).
 
 **Limite 1 — intervalo minimo de 1 HORA.** O servidor recusa `*/15 * * * *` com
 `cron interval too short`. O contorno e a defasagem: cada rotina respeita o limite, e
@@ -1273,18 +1356,27 @@ mudanca de configuracao foi necessaria.
 rotina (`chatmcp.googleapis.com` e `calendarmcp.googleapis.com`; o app nao esta liberado no
 Workspace). E o ambiente da rotina so tem credencial de **Chat**.
 
-- Chat: lido pela API REST classica com `GOOGLE_CHAT_*` do ambiente. O desenho que torna
-  viavel: `GET /v1/spaces?pageSize=1000` traz `lastActiveTime` por espaco; filtrando pela
-  janela, ~291 espacos caem para menos de 10, lidos em paralelo com threads.
+- Chat: ate 24/09/2026, lido pela API REST classica com `GOOGLE_CHAT_*` do ambiente. Hoje
+  **o banco le**, por `jarvis.chat_ler(desde)` (limite 4). O desenho que torna viavel
+  continua o mesmo: `GET /v1/spaces?pageSize=1000` traz `lastActiveTime` por espaco;
+  filtrando pela janela, ~330 espacos caem para menos de 10.
 - Calendar: **o banco busca**, por `jarvis.calendario(dias)`, usando a credencial do cofre
   (que tem escopo de Calendar). O cerebro pede `rpc("calendario", {"dias": 14})` e recebe
   os eventos ja em BRT, com `event_id`, link do Meet e participantes.
+
+**Limite 4 — desde 24/09/2026 a rotina nao pode manusear token.** A partir de ~0h daquele
+dia o ambiente passou a recusar, com "Credential Materialization", o script que trocava o
+refresh token por token de acesso. Foram 7+ runs seguidas sem ler o Chat. A correcao foi o
+mesmo padrao do Calendar: `jarvis.chat_ler`, `jarvis.chat_conversa` e `jarvis.chat_get`
+no banco, com a credencial no Vault (secao 19). O prompt da nuvem diz, com todas as
+letras, para **nao tentar de novo nem procurar outro caminho**.
 
 O padrao do limite 3 e o mais reutilizavel deste projeto: **quando o agente precisa de uma
 credencial que ele nao deve carregar, mova a CAPACIDADE para onde a credencial ja mora, em
 vez de mover a credencial para onde o agente esta.** Tentar o contrario foi barrado tres
 vezes — duas por classificador e uma pela propria rotina, que recusou executar e mandou
-notificacao. As tres recusas estavam certas.
+notificacao. As tres recusas estavam certas. O limite 4 e a plataforma chegando a mesma
+conclusao para o Chat.
 
 ### A porta `jarvis_rpc`
 
@@ -1315,7 +1407,8 @@ colar, e o comando de criação.
 ### O ambiente de nuvem
 
 As rotinas rodam num **ambiente de nuvem** da conta do Claude. Este projeto usa o ambiente
-`Default` (`env_01BHtejRkqFuNictopwsJ6n1`).
+`Default` (o id tem a forma `env_…`; pegue o seu com `RemoteTrigger action: "get"` numa
+rotina existente, ou na interface).
 
 Onde mexer: `claude.ai/code` → no compositor, o **chip do ambiente** (ao lado de
 "Selecionar repositório") → **Nuvem** → `Default`, ou **Adicionar ambiente em nuvem**.
@@ -1326,27 +1419,18 @@ O diálogo tem quatro campos (conferido em 02/09/2026):
 |---|---|---|
 | **Nome** | rótulo do ambiente | `Default` |
 | **Acesso à rede** | Nenhum / **Confiável** (recomendado) / Completo / Personalizado | `Confiável` |
-| **Variáveis de ambiente** | texto em formato `.env` | as três `GOOGLE_CHAT_*` |
+| **Variáveis de ambiente** | texto em formato `.env` | **vazio** |
 | **Script de configuração** | bash que roda antes da sessão | vazio |
 
-**As três variáveis:**
-
-```
-GOOGLE_CHAT_CLIENT_ID=<client id>.apps.googleusercontent.com
-GOOGLE_CHAT_CLIENT_SECRET=<client secret>
-GOOGLE_CHAT_REFRESH_TOKEN=<refresh_token>
-```
-
-As três saem do mesmo lugar: o cliente OAuth da seção 1b.2 e o arquivo
-`~/.google_workspace_mcp/credentials/voce@suaempresa.com.json` (campo `refresh_token`).
-O prompt na nuvem troca o refresh token por um token de acesso em
-`https://oauth2.googleapis.com/token` e lê o Chat pela REST.
+**Variáveis: nenhuma.** Até 24/09/2026 iam ali as três `GOOGLE_CHAT_*` (client id, client
+secret e refresh token) para a rotina ler o Chat pela REST. Desde o limite 4 da seção 10b
+quem lê é o banco, e a rotina não toca em token. Se o seu ambiente ainda as tem, apague:
+não servem para nada e são credencial exposta.
 
 ⚠️ **O próprio diálogo avisa: as variáveis são visíveis para qualquer pessoa que use o
-ambiente. Não é cofre.** É por isso que só a credencial de Chat mora ali — que no pior caso
-significa "alguém lê e posta no Chat dele" — e nunca a `service_role` do Supabase, que
-significaria "alguém leu 150 tabelas de outros sistemas". A credencial de Calendar também
-não entra: quem tem escopo de Calendar é o cofre do banco (limite 3 da seção 10b).
+ambiente. Não é cofre.** Era por isso que, mesmo antes, só a credencial de Chat morava ali
+— e nunca a `service_role` do Supabase, que significaria "alguém leu 150 tabelas de outros
+sistemas". Hoje o ambiente está limpo, e toda credencial mora no Vault do banco.
 
 **Sobre "Acesso à rede".** `Confiável` é o nível que barra o host do Supabase com
 `403 connect_rejected` — o limite 2. Existe uma saída de configuração que a seção 10b não
@@ -1399,7 +1483,7 @@ RemoteTrigger  action: "create"  body:
   "enabled": true,
   "persist_session": false,
   "session_request": {
-    "environment_id": "env_01BHtejRkqFuNictopwsJ6n1",
+    "environment_id": "<id do seu ambiente, env_...>",
     "config": {
       "model": "claude-sonnet-5",
       "allowed_tools": ["preset:default", "Bash", "Read", "Write", "TodoWrite"]
@@ -1412,19 +1496,20 @@ RemoteTrigger  action: "create"  body:
   "mcp_connections": [
     { "name": "Supabase", "transport_type": "http",
       "url": "https://mcp.supabase.com/mcp",
-      "connector_uuid": "51ccbfef-b934-43cb-9141-24e358308c6d" }
+      "connector_uuid": "<uuid do conector Supabase na sua conta>" }
   ]
 }
 ```
 
-As quatro, hoje:
+As quatro, com o cron de cada uma (o `id` de cada rotina, `trig_…`, é o que o `create`
+devolve — anote, é com ele que se faz `update` e `run`):
 
-| rotina | cron | id |
-|---|---|---|
-| Jarvis — cérebro :07 | `7 * * * *` | `trig_016HYVtYu6Q4LCNzyLTuLc7T` |
-| Jarvis — cérebro :22 | `22 * * * *` | `trig_01GjgZQsJjSVhbBG2h4Uxp1M` |
-| Jarvis — cérebro :37 | `37 * * * *` | `trig_01WLrEgwpT63J2P2E5RDM9L8` |
-| Jarvis — cérebro :52 | `52 * * * *` | `trig_01Hs3Heko7bNc98bVKVavbKB` |
+| rotina | cron |
+|---|---|
+| Jarvis — cérebro :07 | `7 * * * *` |
+| Jarvis — cérebro :22 | `22 * * * *` |
+| Jarvis — cérebro :37 | `37 * * * *` |
+| Jarvis — cérebro :52 | `52 * * * *` |
 
 Cinco detalhes que só se descobrem errando:
 
@@ -1460,8 +1545,14 @@ Execução espontânea confirmada: a `:52` rodou às 17:52 UTC de 02/09/2026 com
 
 ## 11. Registrar a tarefa do cérebro local
 
-Só **uma** tarefa do Windows. A entrega virou cron no banco, e a tarefa `Jarvis Dispara`
-foi removida em 01/09/2026.
+Uma tarefa do Windows para o cérebro, `Jarvis Escuta`. A entrega virou cron no banco, e a
+tarefa `Jarvis Dispara` foi removida em 01/09/2026. (A segunda tarefa da máquina,
+`Jarvis Sincroniza Google`, é criada pelo próprio `sincronizar-google.ps1 -Configurar` —
+seção 19.3.)
+
+Este cérebro é **redundância**: as quatro rotinas da nuvem já dão 15 min com o PC
+desligado. Com o PC ligado, quem pegar o lock primeiro roda; na prática o local encurta o
+tempo até um pedido feito no espaço de alertas ser lido.
 
 **Duas armadilhas do Windows, as duas custaram tempo neste build:**
 
@@ -1537,13 +1628,24 @@ select jarvis.upsert_compromisso('aviso','Teste de entrega', now() - interval '2
        jarvis.entregar('teste');
 ```
 
-Esperado: `{"devidos":1,"entregues":1,"erros":0,"via":"webhook"}` e a mensagem no espaço,
-começando com `ℹ️` e com a marcação da pessoa. Rode **de novo**: tem que voltar
-`devidos: 0` — o `status='disparado'` segura. Apague o compromisso de teste depois.
+Esperado: `devidos: 1`, `entregues: 1`, `erros: 0`, e a mensagem no espaço com o `ℹ️` e a
+marcação da pessoa na primeira linha. Rode **de novo**: tem que voltar `devidos: 0` — o
+`status='disparado'` segura. Apague o compromisso de teste depois.
 
 **12.2b — confira QUEM postou.** Leia a mensagem de volta pela API do Chat e olhe o autor.
 Se aparecer como a própria pessoa, a marcação **não vai notificar** — o Chat não avisa
-ninguém das próprias mensagens. Tem que aparecer como a identidade do webhook.
+ninguém das próprias mensagens. Tem que aparecer como o app "Jarvis" (com
+`config.via_app = true`) ou como a identidade do webhook (reserva).
+
+**12.2d — o botão, com o app.** Clique no botão do aviso de teste dentro do Chat. O card tem
+que se atualizar no lugar ("✅ Resolvido às HH:MM" e um botão de desfazer), sem abrir aba.
+Cada clique deixa rastro, etapa por etapa:
+
+```sql
+select * from jarvis.chat_app_cliques limit 5;
+```
+
+"Jarvis não processou sua solicitação" no Chat, sem linha nova ali, é o beco da seção 20.4.
 
 **12.2c — os rótulos.** Crie um de cada tipo, dois deles com `prioridade => 'alta'`, e
 dispare. Confira que os `alta` chegaram **primeiro** e com `🔴` na frente, e que nenhum
@@ -1608,13 +1710,20 @@ de 5 min; a entrega precisa. Daí a separação — e a entrega, sendo SQL puro,
 
 **"Por que o cérebro não posta direto?"** Porque perderia a precisão de hora (ver acima),
 porque duas portas de saída significam duas deduplicações para manter, e porque postando
-com a credencial da pessoa a marcação dela não notifica. Com uma porta — o webhook, no
-banco — o `fingerprint` e o `status` resolvem tudo.
+com a credencial da pessoa a marcação dela não notifica. Com uma porta — a entrega, no
+banco, pelo app ou pelo webhook — o `fingerprint` e o `status` resolvem tudo.
 
-**"Por que o cérebro é duplo (nuvem 1h + local 15 min) em vez de só nuvem?"** Porque
-rotina na nuvem tem **mínimo de 1 hora**; o servidor recusa `*/15`. E porque a rede do
-ambiente agendado pode não alcançar o banco (ver 10b). O local é o caminho rápido, a nuvem
-é o piso.
+**"Por que o cérebro é duplo (quatro rotinas na nuvem + local) em vez de só nuvem?"** A
+nuvem sozinha já dá 15 min: são quatro rotinas horárias defasadas, porque o servidor recusa
+`*/15`. O local fica porque uma das duas metades pode cair sem aviso — a nuvem já perdeu o
+Chat por um dia inteiro (limite 4 da seção 10b), o PC fica sem rede — e com as duas o
+buraco só existe quando as duas caem juntas, que é exatamente o caso que o
+`jarvis.vigiar()` pega.
+
+**"Por que não deixar o cérebro ler o Chat direto, se o MCP local lê?"** Porque aí são dois
+leitores com formatos diferentes. Foi o que gravou a mesma conversa com dois `space_id` e
+fez o Jarvis cobrar pergunta já respondida (seção 21). Com os dois cérebros lendo por
+`jarvis.chat_ler`, toda mensagem chega com o id real do espaço e o mesmo formato.
 
 **"Por que funções em vez de `insert` no prompt?"** Porque citação obrigatória,
 deduplicação, teto de 1200 caracteres e log de antes/depois são invariantes. No prompt
@@ -1663,7 +1772,9 @@ Os quinze, e o mecanismo que tapa cada um:
    `jarvis.tentar_lock` de 20 min no banco.
 10. **Card de convite que não vem como texto** → não confia no card. Lê o Calendar direto
     (`get_events`, 14 dias) e compara com o banco.
-11. **Nome voltando como `users/123`** → `estado.pessoas`, preenchido pelo agente conforme as pessoas aparecem.
+11. **Nome voltando como `users/123`** → `estado.pessoas`, preenchido pelo agente conforme as pessoas aparecem;
+    desde 23/09/2026 o banco completa o que falta pela People API (`jarvis.nome_pessoa`) e
+    troca todo `users/ID` solto pelo nome antes de postar (`jarvis.corrigir_nomes`).
 12. **Fuso e horário de verão** → tudo em UTC (`timestamptz`), renderizado em
     `America/Sao_Paulo` só na hora de escrever.
 13. **Supabase ou internet fora** → `pendente-envio.jsonl` local, e o watermark não avança.
@@ -1681,6 +1792,14 @@ Os quinze, e o mecanismo que tapa cada um:
   em rede. Cabe no plano do Supabase sem aparecer.
 - **Banco:** ~2.800 linhas de mensagem em regime, e o resto são linhas pequenas. Não
   cresce.
+- **Ler o Chat pelo banco** (`chat_ler`) não custa LLM: é HTTP de dentro do Postgres.
+  Referência deste build: 20h de Chat, ~330 espaços listados, 335 mensagens em ~15 s.
+- **Para ver o gasto real:** as rotinas anotam os tokens de cada run em `jarvis.consumo`
+  (`OTIMIZAR-CONSUMO.md`), e o painel `jarvis-gasto/` mostra hoje hora a hora e os últimos
+  7 ou 30 dias. Rode `sql/gasto-painel.sql` (cria `public.jarvis_gasto`), copie
+  `config.exemplo.js` para `config.js` com a URL e a chave publicável, e abra com
+  `python -m http.server 4180` dentro da pasta. O dólar ali é teórico — "quanto custaria na
+  API" —, ordem de grandeza e não fatura.
 
 ---
 
@@ -1688,18 +1807,26 @@ Os quinze, e o mecanismo que tapa cada um:
 
 ```powershell
 Unregister-ScheduledTask -TaskName "Jarvis Escuta" -Confirm:$false
+Unregister-ScheduledTask -TaskName "Jarvis Sincroniza Google" -Confirm:$false
+```
+
+```bash
+supabase functions delete chat-app  --project-ref SEU_PROJECT_REF
+supabase functions delete chat-post --project-ref SEU_PROJECT_REF
+supabase functions delete resolver  --project-ref SEU_PROJECT_REF
 ```
 
 ```sql
-select cron.unschedule('jarvis-entrega');
+select cron.unschedule(jobname) from cron.job where jobname like 'jarvis%';
 drop schema jarvis cascade;
 drop function if exists public.jarvis_rpc(text, text, jsonb);
 drop function if exists public.jarvis_saude();
 -- e os demais public.jarvis_*
 ```
 
-Apague também, pelo painel do Supabase, os segredos `jarvis_google_chat` e
-`jarvis_chat_webhook` do Vault. E desative as **quatro** rotinas na nuvem por
+Apague também, pelo painel do Supabase, os segredos `jarvis_*` do Vault (seção 1c.2).
+Tire o app "Jarvis" do espaço e apague a conta de serviço dele — ou o projeto Google
+inteiro, se foi criado só para o app. Se hospedou a página do `app-resolver/`, derrube-a. E desative as **quatro** rotinas na nuvem por
 `RemoteTrigger` (`action: "list"` para achá-las por nome, depois `update` com
 `enabled: false` em cada uma) — se ficarem ligadas sem o banco, cada uma vai falhar de
 hora em hora e mandar notificação.
@@ -1713,12 +1840,12 @@ A pasta local pode ser apagada.
 
 ## 17. Becos sem saída — o que já foi tentado e não funciona
 
-Cada linha aqui custou tempo entre 31/08 e 02/09/2026. Elas não são história: são caminhos
+Cada linha aqui custou tempo entre 31/08 e 30/09/2026. Elas não são história: são caminhos
 que **parecem** os óbvios e que você vai tentar de novo se não estiverem escritos.
 
 | o que se tenta | o que acontece | o caminho que funciona |
 |---|---|---|
-| MCP do Google Chat na nuvem (`chatmcp.googleapis.com`) | `The caller does not have permission` em **todas** as ferramentas. O app não está liberado no Workspace, e liberar depende do administrador | API REST comum do Chat com o refresh token do ambiente |
+| MCP do Google Chat na nuvem (`chatmcp.googleapis.com`) | `The caller does not have permission` em **todas** as ferramentas. O app não está liberado no Workspace, e liberar depende do administrador | o **banco** lê o Chat (`jarvis.chat_ler`), com a credencial do cofre |
 | MCP do Google Calendar na nuvem (`calendarmcp.googleapis.com`) | mesmo erro | o **banco** busca a agenda (`jarvis.calendario`), com a credencial do cofre |
 | Falar com o Supabase por HTTP/curl/urllib dentro da rotina | `403 connect_rejected` — o proxy de saída do ambiente tem allowlist; `googleapis.com` passa, o host do Supabase não | conector MCP do Supabase, que sai por `mcp-proxy.anthropic.com` e não passa pelo proxy |
 | Levar a credencial de Calendar para dentro da rotina | barrado **três vezes** — duas por classificador e uma pela própria rotina, que recusou executar e mandou notificação. As três recusas estavam certas | mover a **capacidade** para onde a credencial já mora: a função no banco |
@@ -1732,6 +1859,13 @@ que **parecem** os óbvios e que você vai tentar de novo se não estiverem escr
 | Chamar o MCP de Chat sem `user_google_email` | responde como `conta-servico@suaempresa.com`, que **não vê os espaços pessoais** — lista curta, plausível, sem erro | passar o email dele em toda chamada |
 | Tratar "lock tomado" como falha | o modelo insiste, força, e você ganha trabalho duplicado | abortar é o comportamento **correto**; está escrito no prompt de propósito |
 | Chamar `fechar_run` quando a run deu errado | o watermark avança e a janela de mensagens é perdida para sempre | não fechar; só `soltar_lock`. Perder uma run é aceitável, perder mensagem não |
+| Trocar refresh token por token de acesso num script dentro da rotina na nuvem | desde 24/09/2026, recusado com "Credential Materialization"; a rotina fica sem Chat | `jarvis.chat_ler` no banco (seção 19) |
+| Varrer o Chat com `search_messages` | não devolve id de espaço: a mesma conversa ganha dois `space_id` e a resposta não casa com a pergunta | `chat_ler`, que devolve o id real de todo espaço (seções 19 e 21) |
+| Servir a página do botão por uma Edge Function do Supabase | o domínio devolve toda resposta como `text/plain` com `nosniff`: o navegador mostra o código da página | Edge só com JSON (`resolver`) e a página em outro host (`app-resolver/`) |
+| `openAs: OVERLAY` no botão de card postado por webhook | o webhook aceita (HTTP 200) e o Chat **ignora**: abre aba igual | app de Chat com botão de ação (seção 20) |
+| No app criado como "complemento do Workspace", botão com `function` = um nome (`acao`) | o Chat nem chama o endpoint e mostra "Jarvis não processou sua solicitação" | `function` = a **URL completa** do endpoint (seção 20.4) |
+| Deixar duas versões da mesma função com número de argumentos diferente (`upsert_compromisso`, `agendar_pedido`, `gravar_mensagens`) | chamada curta dá "is not unique" — o `vigiar()` chegou a não conseguir gravar o aviso de cérebro parado | `drop` da versão velha; conferir em `pg_proc` que sobrou uma só |
+| Instrução no prompt como paliativo de um default ruim do banco | "todo dia às 9h" nascia com fim em 7 dias, porque o prompt mandava, e ninguém lembrava por quê | consertar o default na função (seção 22.3) e tirar o paliativo do prompt |
 
 **O padrão mais reutilizável do projeto**, o único que vale copiar para outros agentes:
 quando o agente precisa de uma credencial que ele não deve carregar, **mova a capacidade
@@ -1743,8 +1877,8 @@ para onde a credencial já mora**, em vez de mover a credencial para onde o agen
 
 ## 18. Pedidos pelo próprio espaço de alertas
 
-Quem reconstrói isto do zero **precisa aplicar esta parte também** — sem ela o dono não
-consegue pedir lembrete, e o cérebro volta a ser cego para o espaço de alertas.
+Esta parte já vem em `sql/00-fundacao/`. Ela não é opcional: sem ela o dono não consegue
+pedir lembrete, e o cérebro volta a ser cego para o espaço de alertas.
 
 ### 18.1 As três migrações
 
@@ -1760,14 +1894,16 @@ Nomes no histórico do Supabase, nesta ordem:
    `encerrar_serie` e `pedidos_ativos`, e `catalogo_rotulos` passa a listar `lembrete`.
 
 Numa reconstrução com o banco ainda vivo, o SQL exato sai de
-`select pg_get_functiondef('jarvis.agendar_pedido(text,text,timestamptz,int,timestamptz,text,text,timestamptz,text,boolean)'::regprocedure);`
-(e equivalentes). Num banco novo, reescreva a partir do contrato abaixo — ele é completo.
+`select pg_get_functiondef('jarvis.agendar_pedido'::regproc);` (e equivalentes; `regproc`
+sem argumentos só funciona porque existe uma versão só). Num banco novo, aplique a
+fundação — ela já traz as três migrações; o contrato abaixo é o porquê.
 
 ### 18.2 O contrato de `jarvis.agendar_pedido`
 
 Argumentos, na ordem: `p_titulo`, `p_origem_texto`, `p_alerta_em` (null = agora),
 `p_repetir_min` (null = uma vez só), `p_repetir_ate`, `p_mensagem_alerta`, `p_prioridade`,
-`p_origem_msg_time`, `p_run_id`, `p_confirmar` (default `true`).
+`p_origem_msg_time`, `p_run_id`, `p_confirmar` (default `true`) e, desde setembro,
+`p_urgencia_motivo`. Existe **uma** versão só da função — ver seção 17.
 
 O que ela garante, e por que cada coisa está ali:
 
@@ -1777,7 +1913,9 @@ O que ela garante, e por que cada coisa está ali:
   Os 6 caracteres são também a *handle* que ele digita para desligar.
 - **Recusa `p_repetir_min < 5`** (a entrega roda de 5 em 5 min; abaixo disso é mentira) e
   **recusa pedido que geraria mais de 60 avisos**.
-- **Sem `p_repetir_ate`, a série morre em 8 horas.** Cron sem fim vira ruído.
+- **Sem `p_repetir_ate`, a série morre em 8 horas** quando o intervalo é curto (5 a 60
+  min): cron sem fim vira ruído. Para intervalo de um dia ou mais, o padrão é **30 dias**
+  desde 18/09/2026 (seção 22.3).
 - **`p_origem_texto` vazio é exceção**, igual a `upsert_compromisso`: nem pedido dele entra
   sem a citação literal.
 - **`fingerprint` = `serie || ':' || <hora UTC da ocorrência>`**, então as ocorrências da
@@ -1827,3 +1965,304 @@ automações"; isso reduz o risco para as mensagens novas, não para o históric
 
 Só as mensagens que passam no filtro entram em `gravar_mensagens`; o resto do espaço não é
 gravado.
+
+---
+
+## 19. A leitura do Chat mora no banco (24/09/2026)
+
+Tudo desta seção já vem em `sql/00-fundacao/`. O histórico comentado está em
+`sql/chat-ler-no-banco-24-09.sql` e `sql/fix-mensagem-sem-id-24-09.sql`.
+
+### 19.1 As três funções
+
+Desde 24/09/2026 o ambiente da nuvem recusa script que manuseia token (limite 4 da seção
+10b). A leitura do Chat foi para onde a credencial já morava, como o Calendar tinha ido:
+
+| função | o que faz |
+|---|---|
+| `jarvis.chat_ler(desde, max_espacos)` | lista os ~330 espaços (paginado), fica com os que tiveram movimento depois de `desde` e devolve as mensagens em ordem, já no formato de `gravar_mensagens`, com `space_id` real, `thread`, `resposta_em_conversa`, `autor_id` e `cortado` |
+| `jarvis.chat_conversa(space, thread)` | a raiz de uma conversa — para saber a que aviso uma resposta se refere |
+| `jarvis.chat_get(caminho)` | GET somente-leitura em `spaces/...` da API do Chat, para o que as outras duas não cobrem |
+
+As três usam `jarvis.token_google()`, que troca o refresh token do Vault
+(`jarvis_google_chat`) por um token de acesso. Entram no `public.jarvis_rpc` (`chat_ler`,
+`chat_conversa`, `chat_get`) e ficam **fechadas para `anon` e `authenticated`**. Nenhuma
+credencial passa pela sessão do cérebro: ele manda uma data e recebe mensagens.
+
+Referência deste build: 20h de Chat, 335 mensagens, ~15 s.
+
+### 19.2 O id real de todo espaço
+
+O bônus de ler pelo banco é que **toda mensagem sai com o `spaces/...` de verdade**. Antes,
+a varredura por `search_messages` trazia só o nome do chat, e a mesma conversa acabava
+gravada com dois endereços — um com id (vindo do aprofundamento) e outro
+`desconhecido:<nome>`. A resposta do dono num endereço não fechava a pergunta gravada no
+outro, e o Jarvis cobrava o que já estava respondido (seção 21).
+
+A auditoria diária (seção 10) acusou "mensagens sem o id do chat" quatro vezes entre 18 e
+24/09. O que ficou no banco como rede:
+
+- `jarvis.espaco_por_nome(nome)` — acha o id pelo mapa de DMs ou pelo **único** `spaces/`
+  já visto com aquele nome. Nome genérico ou ambíguo devolve null, de propósito.
+- `gravar_mensagens` usa isso antes de cair em `desconhecido:`, não grava de novo o que já
+  existe com id, e no fim chama `jarvis.resgatar_espacos(nomes do lote)` para consertar o
+  que entrou antes sem id.
+
+A correção definitiva veio em 29/09: a escuta local, que ainda varria com
+`search_messages`, passou a ler por `chat_ler` também. `search_messages` e `list_spaces`
+saíram da allowlist do `escuta.ps1`.
+
+### 19.3 A credencial do Vault em dia: `sincronizar-google.ps1`
+
+O banco usa uma **cópia** da credencial do MCP `google-workspace`. Quando o Google revoga a
+cópia do banco, a do PC continua boa (o MCP renova, ou a pessoa faz login de novo) — e o
+Chat e o Calendar do Jarvis ficavam parados até alguém colar a nova à mão.
+
+O `sincronizar-google.ps1` roda a cada 30 min (tarefa `Jarvis Sincroniza Google`) e empurra
+a credencial do PC para o Vault **sempre que o refresh token muda**. Três travas:
+
+1. O banco só grava se o **Google aceitar** a credencial:
+   `public.jarvis_sincronizar_google` testa o refresh token em
+   `oauth2.googleapis.com/token` antes de tocar no segredo.
+2. A porta exige um token que só aquele PC tem, cifrado com DPAPI (só aquele usuário do
+   Windows abre). O banco guarda só o sha256, em `jarvis_sync_google_hash`.
+3. O arquivo do token (`sync-google.token`) está no `.gitignore`.
+
+Instalação: edite no topo do script o email, o `SEU_PROJECT_REF` e a chave anon; rode
+`sincronizar-google.ps1 -Configurar` uma vez (gera o token e agenda a tarefa); cole o hash
+impresso em `sql/sincronizar-google.sql` e rode no SQL Editor. Falha vai para o mesmo
+`falhas.jsonl` do `escuta.ps1`, e vira aviso na run seguinte.
+
+---
+
+## 20. O app de Chat "Jarvis" e os botões (22 a 25/09/2026)
+
+### 20.1 Por que um app, se o webhook funciona
+
+O webhook só posta: não recebe clique. Botão em card de webhook é **link**, que abre uma
+aba. Foi medido no navegador do dono antes de começar: `openAs: OVERLAY` é aceito e
+ignorado, e o Chrome dá foco à aba nova no momento em que a cria. Só um app de Chat
+recebe o clique de volta e troca o card no lugar, sem aba.
+
+A condição para trocar foi uma só: **a marcação postada pelo app tem que vibrar o
+celular**. Foi confirmado antes de ligar `config.via_app`. Se não vibrasse, o webhook
+continuava — a notificação é o que faz a pessoa ler o aviso.
+
+As peças:
+
+| peça | o que faz |
+|---|---|
+| `edge/chat-app.ts` (Edge Function `chat-app`) | recebe o clique, confere o token do Google, chama `jarvis.resolver_item` e devolve o card atualizado |
+| `edge/chat-post.ts` (Edge Function `chat-post`) | assina o JWT RS256 da conta de serviço e posta como o app; aceita `message.thread` para responder dentro de uma conversa |
+| `jarvis.postar_como_app(corpo, space)` | a porta do banco para o `chat-post`, com o token interno |
+| `public.jarvis_chat_credenciais(token)` | troca o token interno pela chave do Vault; só `service_role` chama |
+| `jarvis.postar_lote` | o disparo: app primeiro, webhook se falhar, texto se o card falhar |
+| `jarvis.chat_app_log` + view `jarvis.chat_app_cliques` | cada clique e cada post, etapa por etapa, por 14 dias |
+| `jarvis.estado` chave `chat_app` | nome, projeto, número do projeto e endpoint |
+
+O Postgres não assina RS256 — daí a Edge Function no meio. A chave não se move: quem chama
+passa um token e recebe um resultado.
+
+### 20.2 Os botões
+
+Cada aviso leva no máximo dois botões, escolhidos pelo `subtipo` em
+**`jarvis.categorias.botoes`** (array jsonb de `{acao, texto}`). Mudar o botão de uma
+categoria é um `update`, não um deploy. Seis categorias não têm botão: são recibo, não
+pedido. O mapa completo está em `PLANO-BOTOES.md`.
+
+| ação | o que faz |
+|---|---|
+| `resolver` | `encerrar_compromisso(cumprido)` e corta a série — o botão "✅ Finalizar aviso" |
+| `adiar` | reagenda para +1h, ou amanhã 9h se já for fora do expediente — "⏰ Me lembra depois" |
+| `responder` | abre a conversa de origem no Chat, sem mudar nada |
+| `agenda` | abre o **dia** do compromisso no Calendar (link de evento daria 404: nenhuma linha tem `calendar_event_id`) |
+| `manter` | só pelo app: a pergunta em que ele reagiu com emoji ambíguo volta a cobrar (seção 24) |
+| `desfazer` | volta o item ao estado anterior |
+
+"Já fiz" e "Cancelar aviso" viraram um botão só em 22/09: os dois chamavam
+`encerrar_compromisso` e cortavam a série, e **ninguém lê a diferença** entre `cumprido` e
+`cancelado` — nem o briefing nem o resumo. A ação `cancelar` segue na API, sem botão.
+
+Botão que não tem como existir não aparece: "Responder" sem `space_origem`, "Abrir agenda"
+sem `quando_utc`. Se não sobrar nenhum, o aviso sai só com o texto.
+
+O que autoriza o clique é `jarvis.compromissos.token` — aleatório, 18 caracteres, com
+default na coluna. Pelo app ele vai nos `parameters` do botão; pelo link, na URL.
+
+### 20.3 Instalar, em resumo
+
+O roteiro passo a passo está no **Passo 6b do `COMO_INSTALAR.md`**. Os pontos que não são
+óbvios:
+
+1. **As três Edge Functions sobem com `--no-verify-jwt`.** Quem chama não é usuário do
+   Supabase, então o JWT do Supabase nunca viria. Cada uma tem a sua trava: `chat-app`
+   confere a assinatura do Google (nunca aceita token sem assinatura conferida), `resolver`
+   exige o token aleatório do aviso, `chat-post` exige o token interno
+   `jarvis_chat_post_token`, que nasce e fica no banco.
+2. **`SEU_PROJECT_NUMBER` em `edge/chat-app.ts`.** É o número do projeto Google onde o app
+   foi criado (não é segredo: aparece na tela do projeto). O token que o Google manda tem
+   esse número, ou a conta `service-<numero>@gcp-sa-gsuiteaddons…`, e o endpoint recusa
+   qualquer outro.
+3. **O endpoint do app** é `https://SEU_PROJECT_REF.supabase.co/functions/v1/chat-app`, o
+   mesmo para todos os gatilhos, e é gravado também em `jarvis.estado.chat_app.endpoint` —
+   o banco usa esse valor para montar o botão (20.4).
+4. **A chave da conta de serviço vai para o Vault (`jarvis_chat_sa`) e o arquivo é
+   apagado do disco.** Escopo usado: `chat.bot`.
+5. **O app precisa ser membro do espaço.** Sem isso, `postar_como_app` volta
+   `403 This Chat app is not a member of this space` — que é a boa notícia: a chave
+   assinou, o Google deu token e a API respondeu.
+6. **A página do botão por link mora fora do Supabase.** O domínio `supabase.co` devolve
+   toda resposta de Edge Function como `text/plain` com `nosniff` (política anti-phishing
+   deles): a página aparecia como código. Por isso a Edge `resolver` só fala JSON, e a
+   página é o `app-resolver/`, num host que sirva HTML (`export default { fetch }` roda em
+   Cloudflare Workers, Deno Deploy e afins). O banco aponta para ela por
+   `config.resolver_url`. A página fecha a própria aba em ~0,6 s depois do clique (a aba foi
+   aberta por script, então `window.close()` funciona); clicar de novo no mesmo botão a
+   mantém aberta, com o desfazer à mão. Página de erro nunca se fecha.
+
+### 20.4 Os becos do app
+
+- **"Complemento do Workspace".** O formulário do app tem essa caixa, e desmarcar é
+  irreversível. Neste build ela ficou marcada, e isso muda três coisas: (a) o `function`
+  do botão tem que ser a **URL completa do endpoint**, não um nome — com nome o Chat nem
+  chama o endpoint e mostra "Jarvis não processou sua solicitação" (provado com três
+  variantes lado a lado: link abre aba, URL resolve, nome dá erro); (b) o token é um id
+  token do Google com `aud` = URL do endpoint e `email` = conta
+  `service-<numero>@gcp-sa-gsuiteaddons`; (c) a resposta vai embrulhada em
+  `hostAppDataAction.chatDataAction.updateMessageAction`. O `chat-app.ts` aceita os dois
+  formatos, o de complemento e o de app de Chat clássico.
+- **Três 401 seguidos e o Google para de chamar.** No primeiro teste a verificação do
+  token estava errada; depois de três recusas o Chat parou de mandar evento por um tempo,
+  mesmo em mensagem nova. Se acontecer, conserte, espere e clique uma vez — e confira
+  primeiro em `jarvis.chat_app_cliques` se o request está chegando.
+- **Card não notifica.** Quem faz o celular vibrar é o campo `text` da mensagem, com a
+  marcação `<users/ID>`. A mensagem vai sempre com os dois: texto curto em cima, card
+  embaixo.
+- **`decoratedText` interpreta HTML.** Todo texto que vem do Chat passa por
+  `jarvis.esc_html` antes de entrar no card, ou um `<` numa citação vira tag.
+
+### 20.5 Responder dentro do aviso
+
+Quando o app posta, `postar_lote` grava a conversa do aviso em
+`jarvis.compromissos.chat_thread`. Se o dono responde **dentro** daquela conversa ("já
+fiz", "adia pra sexta"), o `chat_ler` marca `resposta_em_conversa`, e o cérebro acha o
+aviso por `jarvis.avisos_da_conversa(thread)` — sem precisar do "jarvis" na frente. Leva
+até 15 min (é a próxima run do cérebro); resposta na hora só com @Jarvis, regra do Google.
+Aviso antigo, ou que saiu pelo webhook, não tem `chat_thread`: o cérebro lê a raiz da
+conversa com `chat_conversa`.
+
+---
+
+## 21. Pergunta sem resposta: o que evita a cobrança falsa (04 a 28/09/2026)
+
+Pergunta aberta cobra de 30 em 30 min por 6 horas e para. É a categoria que mais irritou
+quando errou, porque um falso positivo vira doze cobranças. As regras, todas no banco:
+
+1. **Conversa ativa não é silêncio.** Se o dono falou até `config.conversa_ativa_min`
+   (5) minutos **antes** da pergunta e quem perguntou nunca repetiu, ela não nasce. Caso
+   real: a pergunta chegou 59 s depois da última fala dele, a exclusão só aceitava
+   resposta posterior, e o aviso saiu seis vezes.
+2. **O autor pode encerrar sozinho.** Um "boa", "blz" do próprio autor até
+   `config.encerrou_autor_min` (30) minutos depois, sem pergunta nova, fecha. Sem isso
+   **nenhuma DM fechava**: a regra antiga exigia um terceiro respondendo, e numa conversa
+   de duas pessoas não existe terceiro. A troca aceita: pergunta abandonada no meio de um
+   papo, que ninguém repete, não gera alerta.
+3. **A mesma conversa é um endereço só.** `jarvis.chave_espaco(space_id, space_nome)` é o
+   endereço canônico da conversa, e as comparações de `silencio_dele` usam ela. Antes
+   havia 73 `space_id` para 34 conversas.
+4. **A identidade da pergunta é a mensagem que a originou, não o título.**
+   `upsert_compromisso` exige `p_origem_msg_time` em `pergunta_aberta`, e mesma pessoa +
+   mesma conversa + mensagem a ±30 min = **uma série só, em qualquer status**. Duas
+   versões disso: em 10/09 só barrava se a anterior tivesse sido cancelada ou cumprida; em
+   28/09 uma série que esgotou as 6h ficava "disparado" e a run seguinte, reescrevendo o
+   título, criava uma série nova — a mesma pergunta foi cobrada ~27 vezes em três dias.
+   Agora devolve `{"acao": "ignorado", "nota": …}`.
+5. **`encerrar_serie` mata `pergunta:`.** Até 09/09 a função prefixava `pedido:` em tudo,
+   casava zero linhas numa série de pergunta e devolvia `{"cancelados": 0}` — sucesso
+   aparente. Alerta que repete de 30 em 30 min era, por construção, impossível de
+   desligar. Hoje casa a série com qualquer prefixo e devolve também `recorrencia_cortada`.
+6. **A hora do texto vem sempre de um campo `_brt`.** O cérebro roda em contêiner UTC; o
+   briefing manda `quando_brt` pronto ao lado de `msg_time_utc`, e o prompt proíbe usar o
+   segundo no texto. Um aviso disse 13h09 para uma mensagem das 10h09.
+
+---
+
+## 22. Outras correções que quem instala herda
+
+### 22.1 Ordem longa não pode chegar cortada
+
+Do espaço de alertas o cérebro local lê **tudo**, com uma chamada fixa de `get_messages` por
+run, fora do teto de aprofundamentos. A varredura antiga cortava o texto em 100
+caracteres: uma mensagem de 525 caracteres com 15 pedidos chegou como os primeiros 100, e
+os outros 14 sumiram. Ordem cortada é ordem perdida.
+
+### 22.2 O aviso tem que dizer quem e o quê
+
+`jarvis.checar_alerta_vago()` derruba a chamada quando o texto do alerta traz pronome no
+lugar do nome ("a outra pessoa", "essa pessoa", "com alguém"). Vale para
+`upsert_compromisso` **e** `agendar_pedido`: pedido do dono não dispensa nome. Veja também a
+seção 23.
+
+### 22.3 Lembrete diário não morre em 7 dias
+
+"Todo dia às 9h" sem data de fim nascia com fim em +7 dias — **instrução do próprio
+prompt**, um paliativo para o default de 8h de `agendar_pedido`, que mataria o diário na
+primeira ocorrência. Desde 18/09/2026: com `p_repetir_min >= 1440` e sem `p_repetir_ate`, o
+padrão é **30 dias** (31 avisos, dentro do teto de 60). Intervalo curto sem fim continua
+morrendo em 8h, e data de fim pedida vale sempre. O dono cancela antes, se o evento passar.
+
+### 22.4 O watermark nunca passa do início da run
+
+Uma run da nuvem começou às 20:25 UTC, leu o Chat, e fechou às 20:34. O prompt mandava
+fechar com uma variável que não estava definida em lugar nenhum; o modelo usou a hora do
+fim, o watermark pulou para 20:34, e as respostas que o dono mandou às 20:28 nunca foram
+lidas — a pergunta que ele tinha respondido virou cobrança. Desde 28/09/2026
+`tentar_lock` grava `inicio_utc`, e `fechar_run` **nunca avança o watermark além do início
+da própria run**. Reler um pedaço é barato (`gravar_mensagens` deduplica); pular é perder
+mensagem.
+
+### 22.5 Aviso de reunião não cita choque
+
+Um aviso de reunião escrito dias antes dizia "nesse mesmo horário você tem X"; a outra
+reunião foi remarcada e o choque cancelado certo, mas o texto do aviso ficou congelado e
+saiu errado. `guarda_compromisso` (a trigger que roda em toda escrita) tira de todo aviso
+`reuniao` a linha que fala de choque e anota o defeito — choque é categoria própria, com
+aviso próprio, que morre quando o choque morre.
+
+---
+
+## 23. Nomes: sempre gente, nunca id (10 e 23/09/2026)
+
+- `jarvis.gravar_mensagens` resolve `autor_nome` pelo mapa `estado.pessoas` quando o
+  payload não traz nome.
+- `jarvis.nome_pessoa(id)` busca no mapa e, se faltar, na **People API** (`people/<id>` —
+  o id do Chat é o id da pessoa no diretório), com a mesma credencial do Calendar, e grava
+  no mapa.
+- `jarvis.corrigir_nomes(texto)` troca todo `users/ID` solto pelo nome, preservando a
+  marcação `<users/ID>`. Roda numa trigger em `compromissos` e na hora de postar.
+- Os prompts mandam o **id cru** quando não souberem o nome, em vez de "alguém" — o banco
+  resolve. Id que ninguém nomeou em lugar nenhum fica id, e o alerta cita a mensagem em
+  vez de inventar.
+
+---
+
+## 24. Reação com emoji conta como resposta (25/09/2026)
+
+Se alguém falou com o dono e ele reagiu com emoji, isso é devolutiva.
+
+- **Emoji claro** (👍 ✅ ☑️ ✔️ 👌 🫡 🤝 💯 🆗, qualquer tom de pele): a pergunta sai do
+  `silencio_dele` (vai para `briefing.reagidas_ok`). Se já havia aviso agendado, a entrega o
+  fecha como `cumprido` e manda um recibo "Você reagiu 👍 à mensagem da Ana…".
+- **Outro emoji** (😂 ❤️ 👀 🙏…): categoria `pergunta_reagida` 🤔, aviso **uma vez só**,
+  terminando com "Você reagiu com 😂 (risada) — continuo te alertando, ou já foi
+  resolvido?". Botões: **🔔 Continua me avisando** (ação `manter`: volta a ser pergunta
+  comum, de 30 em 30 min por 6h) e **✅ Já foi resolvido**.
+- **Como lê:** `jarvis.reacoes_dele(itens)` acha a mensagem pela hora (±2 s) e as do mesmo
+  autor na hora seguinte, e pergunta ao Chat só as reações dele
+  (`reactions?filter=user.name=…`). Na entrega, só olha pergunta que vai sair nos próximos
+  10 min (`reacoes_nos_pendentes`). A coluna `reacao_vista` guarda o emoji já perguntado,
+  para não perguntar duas vezes pelo mesmo.
+- **"Continua me avisando" só existe pelo app.** No modo link o botão some: a página e a
+  Edge `resolver` tratariam ação desconhecida como "resolver".
+
+SQL comentado: `sql/reacao-emoji-25-09.sql`.
